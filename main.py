@@ -298,10 +298,18 @@ async def extract_exif_datetime(image_path: Path) -> Optional[str]:
     return await run_in_threadpool(_extract_exif_datetime_sync, image_path)
 
 
-def build_metadata_cache(folder: Path) -> Dict[str, str]:
+def _build_metadata_cache_sync(folder: Path) -> Dict[str, str]:
     """
-    Reads/writes .metadata.json inside the folder.
-    Returns {filename: exif_date_string}.
+    Synchronous core – always runs in a threadpool, never on the event loop.
+
+    Strategy:
+      1. Load existing .metadata.json (already-extracted EXIF).
+      2. Prune entries whose files were deleted.
+      3. Extract EXIF only for NEW files not yet in the cache.
+      4. Persist the updated cache back to disk (only when dirty).
+
+    This means the *first* request for a large folder pays the full cost once;
+    every subsequent request (or request after a single upload) is O(new files).
     """
     metadata_file = folder / ".metadata.json"
     metadata: Dict[str, str] = {}
@@ -336,30 +344,119 @@ def build_metadata_cache(folder: Path) -> Dict[str, str]:
     return metadata
 
 
+async def build_metadata_cache(folder: Path) -> Dict[str, str]:
+    """Async wrapper – offloads all disk I/O to a threadpool."""
+    return await run_in_threadpool(_build_metadata_cache_sync, folder)
+
+
+def _update_metadata_cache_sync(folder: Path, filename: str) -> None:
+    """
+    Called immediately after a successful photo upload.
+    Adds just the one new file to .metadata.json without scanning the whole folder.
+    This warms the cache so the next list request is instant.
+    """
+    p = folder / filename
+    if p.suffix.lower() not in {".jpg", ".jpeg", ".webp"}:
+        return
+    val = _extract_exif_datetime_sync(p)
+    if not val:
+        return
+    metadata_file = folder / ".metadata.json"
+    metadata: Dict[str, str] = {}
+    if metadata_file.exists():
+        try:
+            with open(metadata_file, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except Exception:
+            metadata = {}
+    metadata[filename] = val
+    try:
+        with open(metadata_file, "w", encoding="utf-8") as f:
+            json.dump(metadata, f)
+    except Exception:
+        pass
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Search index
+# Search index  (incremental)
 # ──────────────────────────────────────────────────────────────────────────────
+#
+# Architecture:
+#   _search_index  – the live dict, always up-to-date after mutations
+#   _index_built_at – timestamp of the last full rebuild
+#   INDEX_TTL       – full rebuild period for drift correction (e.g. manual
+#                     filesystem changes that bypass the API)
+#
+# Mutations (upload / delete / rename) call the surgical helpers below
+# instead of wiping and re-scanning everything.  Full rglob only runs:
+#   • once on startup
+#   • after INDEX_TTL seconds (safety net for out-of-band changes)
+
+def _make_index_entry(p: Path) -> dict:
+    rel = str(p.relative_to(BASE_DIR))
+    return {
+        "name":       p.name,
+        "relpath":    rel,
+        "size_bytes": p.stat().st_size,
+        "size_human": human_size(p.stat().st_size),
+        "mtime":      iso_ts(p),
+        "mime":       mime_type_for(p),
+    }
+
 
 def _rebuild_index() -> None:
+    """Full scan – O(n files). Called at startup and periodically for drift."""
     global _index_built_at
     new_index: Dict[str, dict] = {}
     for p in BASE_DIR.rglob("*"):
         if p.is_file() and not p.name.startswith("."):
             rel = str(p.relative_to(BASE_DIR))
-            new_index[rel] = {
-                "name":       p.name,
-                "relpath":    rel,
-                "size_bytes": p.stat().st_size,
-                "size_human": human_size(p.stat().st_size),
-                "mtime":      iso_ts(p),
-                "mime":       mime_type_for(p),
-            }
+            new_index[rel] = _make_index_entry(p)
     _search_index.clear()
     _search_index.update(new_index)
     _index_built_at = time.monotonic()
 
 
+def _index_add(path: Path) -> None:
+    """Add or update a single file – O(1)."""
+    if path.exists() and path.is_file() and not path.name.startswith("."):
+        rel = str(path.relative_to(BASE_DIR))
+        _search_index[rel] = _make_index_entry(path)
+
+
+def _index_remove(rel: str) -> None:
+    """Remove a single file by its relative path string – O(1)."""
+    _search_index.pop(rel, None)
+
+
+def _index_remove_folder(folder_rel_prefix: str) -> None:
+    """
+    Remove all entries under a folder – O(entries in folder).
+    prefix should be like 'photos/Vacation' (no trailing slash).
+    """
+    prefix = folder_rel_prefix.rstrip("/") + "/"
+    stale  = [k for k in _search_index if k.startswith(prefix)]
+    for k in stale:
+        del _search_index[k]
+
+
+def _index_rename_folder(old_rel: str, new_rel: str) -> None:
+    """
+    Re-key all entries under old_rel to new_rel – O(entries in folder).
+    Avoids a full rglob on rename.
+    """
+    old_prefix = old_rel.rstrip("/") + "/"
+    new_prefix = new_rel.rstrip("/") + "/"
+    renames = {k: v for k, v in _search_index.items() if k.startswith(old_prefix)}
+    for old_key, entry in renames.items():
+        del _search_index[old_key]
+        new_key            = new_prefix + old_key[len(old_prefix):]
+        entry["relpath"]   = new_key
+        _search_index[new_key] = entry
+
+
 def get_index() -> Dict[str, dict]:
+    """Return the live index, triggering a full rebuild only on TTL expiry."""
     if time.monotonic() - _index_built_at > INDEX_TTL:
         _rebuild_index()
     return _search_index
@@ -510,9 +607,12 @@ def rename_folder(old_name: str, payload: RenameRequest, _auth=Depends(require_a
     if target.exists():
         raise HTTPException(status_code=409, detail="Target folder already exists.")
     os.rename(source, target)
-    # Invalidate search index (was a comparison == before – now correctly assigns)
-    global _index_built_at
-    _index_built_at = 0.0
+    # Incremental index update: re-key every affected entry in O(folder size)
+    # instead of a full rglob rebuild.
+    _index_rename_folder(
+        f"photos/{old_name}",
+        f"photos/{payload.new_name}",
+    )
     return {"message": "Folder renamed.", "old": old_name, "new": payload.new_name}
 
 
@@ -522,6 +622,7 @@ def delete_folder(folder_name: str, _auth=Depends(require_api_key)):
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail="Folder not found.")
     shutil.rmtree(folder)
+    _index_remove_folder(f"photos/{folder_name}")
     return {"message": "Folder deleted.", "name": folder_name}
 
 
@@ -530,7 +631,7 @@ def delete_folder(folder_name: str, _auth=Depends(require_api_key)):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.get("/files/photos/{folder_name}", tags=["files"])
-def list_photos_in_folder(
+async def list_photos_in_folder(
     folder_name: str,
     request: Request,
     skip:  int = 0,
@@ -544,7 +645,7 @@ def list_photos_in_folder(
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail="Folder not found.")
 
-    exif_cache = build_metadata_cache(folder)
+    exif_cache = await build_metadata_cache(folder)
     all_files  = sorted(
         (p for p in folder.iterdir() if p.is_file() and not p.name.startswith(".")),
         key=lambda p: p.stat().st_mtime,
@@ -807,9 +908,12 @@ async def upload_photo(
     # Server-side validation with Pillow
     verify_image_file(dest)
 
-    # Invalidate search index
-    global _index_built_at
-    _index_built_at = 0.0
+    # Incremental index: add just this one file – O(1), no full rglob.
+    _index_add(dest)
+
+    # Warm the EXIF cache for this file in the background so the next
+    # list request doesn't have to do it under user-visible latency.
+    await run_in_threadpool(_update_metadata_cache_sync, target_dir, dest.name)
 
     print(f"[UPLOAD] photo → {dest}  ({human_size(dest.stat().st_size)})")
 
@@ -842,8 +946,8 @@ async def upload_video(
     # Server-side validation with ffprobe (no-op if ffprobe is absent)
     verify_video_file(dest)
 
-    global _index_built_at
-    _index_built_at = 0.0
+    # Incremental index: add just this one file – O(1).
+    _index_add(dest)
 
     print(f"[UPLOAD] video → {dest}  ({human_size(dest.stat().st_size)})")
 
@@ -871,8 +975,8 @@ def delete_file(file_path: str, _auth=Depends(require_api_key)):
 
     target.unlink()
 
-    global _index_built_at
-    _index_built_at = 0.0
+    # Incremental index: remove just this one entry – O(1).
+    _index_remove(file_path)
 
     return {"message": "File deleted.", "path": file_path}
 
