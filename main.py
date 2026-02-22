@@ -21,6 +21,7 @@ Run (production):
 # ──────────────────────────────────────────────
 # Standard library
 # ──────────────────────────────────────────────
+import asyncio
 import hashlib
 import html
 import json
@@ -119,6 +120,13 @@ if _WEB_DIR.exists():
 # ──────────────────────────────────────────────────────────────────────────────
 # In-memory state
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Thumbnail generation locks: { thumb_cache_key: asyncio.Lock }
+# Prevents concurrent requests for the same image from generating the thumbnail
+# twice simultaneously and racing on the output file write.
+# Using per-key locks (not one global lock) so requests for *different* images
+# never block each other.
+_thumb_locks: Dict[str, asyncio.Lock] = {}
 
 # Rate limiter: { ip: [timestamp, ...] }
 _ip_counters: Dict[str, List[float]] = {}
@@ -747,22 +755,35 @@ async def thumbnail_image(
     if not mime_type_for(target).startswith("image/"):
         raise HTTPException(status_code=400, detail="Thumbnails are only generated for images.")
 
-    thumb = get_thumb_path(file_path)
+    thumb     = get_thumb_path(file_path)
     src_mtime = target.stat().st_mtime
 
+    # Fast path: valid cached thumbnail already on disk – no lock needed.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
         return FileResponse(thumb, media_type="image/webp")
 
-    try:
-        await run_in_threadpool(_generate_image_thumb_sync, target, thumb)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Thumbnail generation failed: {exc}")
+    # Slow path: acquire a per-thumbnail asyncio.Lock so that if multiple
+    # requests arrive simultaneously for the same image, only ONE actually
+    # runs the generator; the others wait and then hit the fast path above.
+    cache_key = hash_for(file_path)
+    if cache_key not in _thumb_locks:
+        _thumb_locks[cache_key] = asyncio.Lock()
+    lock = _thumb_locks[cache_key]
+
+    async with lock:
+        # Re-check inside the lock – a previous waiter may have just written it.
+        if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
+            return FileResponse(thumb, media_type="image/webp")
+        try:
+            await run_in_threadpool(_generate_image_thumb_sync, target, thumb)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Thumbnail generation failed: {exc}")
 
     return FileResponse(thumb, media_type="image/webp")
 
 
 @app.get("/thumbnail/video/{file_path:path}", tags=["thumbnails"])
-def thumbnail_video(
+async def thumbnail_video(
     file_path: str,
     request: Request,
     _auth=Depends(require_api_key),
@@ -774,21 +795,41 @@ def thumbnail_video(
     if not shutil.which("ffmpeg"):
         raise HTTPException(status_code=501, detail="ffmpeg is not installed – video thumbnails unavailable.")
 
-    thumb = get_thumb_path(file_path)
-    if thumb.exists() and thumb.stat().st_mtime >= src.stat().st_mtime:
+    thumb     = get_thumb_path(file_path)
+    src_mtime = src.stat().st_mtime
+
+    # Fast path: valid cached thumbnail already on disk.
+    if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
         return FileResponse(thumb, media_type="image/webp")
 
-    thumb.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src),
-        "-vframes", "1",
-        "-vf", f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)':force_original_aspect_ratio=decrease",
-        "-f", "image2", str(thumb),
-    ]
-    try:
-        subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        raise HTTPException(status_code=500, detail="ffmpeg failed to generate a thumbnail.")
+    # Slow path: serialise concurrent requests for the same video thumbnail.
+    cache_key = hash_for(file_path)
+    if cache_key not in _thumb_locks:
+        _thumb_locks[cache_key] = asyncio.Lock()
+    lock = _thumb_locks[cache_key]
+
+    async with lock:
+        # Re-check: a previous waiter may have already generated it.
+        if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
+            return FileResponse(thumb, media_type="image/webp")
+
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src),
+            "-vframes", "1",
+            "-vf", f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)':force_original_aspect_ratio=decrease",
+            # Auto-rotate using video stream metadata (equiv of EXIF-transpose for images)
+            "-vf", "transpose=0",
+            "-f", "image2", str(thumb),
+        ]
+        try:
+            await run_in_threadpool(
+                subprocess.check_output, cmd,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            raise HTTPException(status_code=500, detail="ffmpeg failed to generate a thumbnail.")
 
     return FileResponse(thumb, media_type="image/webp")
 
