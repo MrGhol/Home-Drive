@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Home Media — Gallery</title>
+
+  <style>
+    :root {
+      --bg: #0b0d10;
+      --card: #0f1114;
+      --muted: #9aa4b2;
+      --accent: #4da3ff;
+      --text: #eaf0ff;
+      --glass: rgba(255, 255, 255, 0.03);
+    }
+
+    .light {
+      --bg: #f5f7fa;
+      --card: #fff;
+      --muted: #6b7280;
+      --accent: #1563ff;
+      --text: #0b1220;
+      --glass: rgba(0, 0, 0, 0.03);
+    }
+
+    * {
+      box-sizing: border-box
+    }
+
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue";
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 18px;
+      background: rgba(20, 20, 25, 0.6);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      position: sticky;
+      top: 0;
+      z-index: 60
+    }
+
+    h1 {
+      font-size: 16px;
+      margin: 0;
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    input.search {
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 0;
+      outline: none;
+      width: 260px;
+      background: var(--glass);
+      color: var(--text)
+    }
+
+    button.icon {
+      background: var(--accent);
+      border: 0;
+      color: white;
+      padding: 8px 10px;
+      border-radius: 10px;
+      cursor: pointer
+    }
+
+    .container {
+      padding: 18px;
+      max-width: 1200px;
+      margin: 0 auto
+    }
+
+    .breadcrumbs {
+      margin: 10px 0;
+      color: var(--muted);
+      font-size: 14px
+    }
+
+    .grid {
+      display: grid;
+      gap: 12px
+    }
+
+    .folders.grid {
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr))
+    }
+
+    .media.grid {
+      display: block;
+      /* override grid for masonry */
+      column-count: 4;
+      column-gap: 12px;
+    }
+
+    @media (max-width: 1000px) {
+      .media.grid {
+        column-count: 3;
+      }
+    }
+
+    @media (max-width: 700px) {
+      .media.grid {
+        column-count: 2;
+      }
+    }
+
+    @media (max-width: 400px) {
+      .media.grid {
+        column-count: 1;
+      }
+    }
+
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 0;
+      /* removed padding for edge-to-edge images */
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+      cursor: pointer;
+      overflow: hidden;
+      transition: transform .2s ease;
+      position: relative;
+      break-inside: avoid;
+      margin-bottom: 12px;
+      /* masonry gap */
+      opacity: 0;
+      transform: translateY(10px);
+      animation: fadeIn .4s ease forwards;
+    }
+
+    @keyframes fadeIn {
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .card::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(transparent 50%, rgba(0, 0, 0, 0.6));
+      opacity: 0;
+      transition: opacity .2s;
+      pointer-events: none;
+    }
+
+    .card:hover::after {
+      opacity: 1;
+    }
+
+    .card:hover {
+      transform: translateY(-4px)
+    }
+
+    .thumb {
+      width: 100%;
+      height: auto;
+      display: block;
+      object-fit: cover;
+      border-radius: 12px;
+      background: #0a0a0a
+    }
+
+    .folders .thumb {
+      height: 140px;
+      border-radius: 12px 12px 0 0;
+    }
+
+    /* folders still look like cards */
+
+    .meta {
+      padding: 12px;
+      position: absolute;
+      bottom: 0;
+      width: 100%;
+      background: linear-gradient(to top, rgba(0, 0, 0, 0.8), transparent);
+      color: #fff;
+      pointer-events: none
+    }
+
+    .folders .meta {
+      position: relative;
+      background: none;
+      color: var(--text);
+      padding: 10px;
+    }
+
+    .meta h3 {
+      margin: 0;
+      font-size: 15px;
+      text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8)
+    }
+
+    .folders .meta h3 {
+      text-shadow: none;
+    }
+
+    .meta p {
+      margin: 4px 0 0 0;
+      font-size: 13px;
+      color: rgba(255, 255, 255, 0.7);
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8)
+    }
+
+    .folders .meta p {
+      color: var(--muted);
+      text-shadow: none;
+    }
+
+    .small {
+      font-size: 12px;
+      color: var(--muted)
+    }
+
+    /* Context Menu for folders */
+    .menu-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(0, 0, 0, 0.6);
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 32px;
+      height: 32px;
+      font-size: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.2s, background 0.2s;
+      z-index: 10;
+      backdrop-filter: blur(4px);
+    }
+
+    .card:hover .menu-btn {
+      opacity: 1;
+    }
+
+    .menu-btn:hover {
+      background: rgba(0, 0, 0, 0.9);
+    }
+
+    .dropdown {
+      position: absolute;
+      top: 44px;
+      right: 8px;
+      background: var(--card);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+      display: none;
+      flex-direction: column;
+      z-index: 20;
+      overflow: hidden;
+    }
+
+    .dropdown.show {
+      display: flex;
+    }
+
+    .dropdown button {
+      background: transparent;
+      color: var(--text);
+      border: none;
+      padding: 10px 16px;
+      text-align: left;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    .dropdown button:hover {
+      background: var(--glass);
+    }
+
+    .dropdown button.danger {
+      color: #ff5555;
+    }
+
+    .center {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 220px;
+      color: var(--muted)
+    }
+
+    /* modal */
+    .modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.85);
+      z-index: 120;
+      padding: 20px
+    }
+
+    .modal.show {
+      display: flex;
+      animation: fadeModal .2s ease;
+    }
+
+    @keyframes fadeModal {
+      from {
+        opacity: 0;
+        backdrop-filter: blur(0px);
+      }
+
+      to {
+        opacity: 1;
+        backdrop-filter: blur(10px);
+      }
+    }
+
+    .modal-inner {
+      max-width: 95%;
+      max-height: 95%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      flex-direction: column
+    }
+
+    .modal img,
+    .modal video {
+      max-width: 100%;
+      max-height: 85vh;
+      border-radius: 10px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6)
+    }
+
+    .modal .nav {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px
+    }
+
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 8px;
+      cursor: pointer
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    footer {
+      padding: 24px;
+      text-align: center;
+      color: var(--muted)
+    }
+
+    /* responsive tweaks */
+    @media (max-width:600px) {
+      input.search {
+        width: 140px
+      }
+
+      .thumb {
+        height: 120px
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <header>
+    <h1>📸 Home Media</h1>
+    <div class="controls">
+      <input id="search" class="search" placeholder="Search photos & videos..." />
+      <div class="toolbar">
+        <button class="icon" id="btnUpload" title="Upload Media">🔼 Upload</button>
+        <button class="icon" id="btnVideos" title="Show videos">🎬 Videos</button>
+        <button class="icon" id="btnFolders" title="Show folders">🗂️ Folders</button>
+        <button class="icon" id="toggleTheme" title="Toggle theme">🌗</button>
+        <button class="icon" id="setKey" title="Set API key">🔑</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="breadcrumbs" id="breadcrumbs">Home</div>
+    <div id="grid" class="grid folders"></div>
+  </main>
+
+  <!-- upload modal -->
+  <div id="uploadModal" class="modal" onclick="if(event.target===this) closeUploadModal()">
+    <div class="modal-inner card"
+      style="background:var(--card); padding:24px; display:flex; flex-direction:column; gap:16px; max-width:400px; width:100%;">
+      <h2 style="margin:0">Upload Media</h2>
+      <input type="file" id="fileInput" multiple style="color:var(--text); width:100%" />
+      <input type="text" id="folderInput" placeholder="Photo folder (if photo)"
+        style="padding:8px; border-radius:8px; border:1px solid var(--muted); background:var(--bg); color:var(--text); width:100%" />
+      <div class="nav" style="justify-content:flex-end; width:100%">
+        <button class="btn-ghost" onclick="closeUploadModal()">Cancel</button>
+        <button class="icon" id="startUpload" style="padding:8px 16px">Start Upload</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal viewer -->
+  <div id="modal" class="modal" onclick="if(event.target===this) closeModal()">
+    <div class="modal-inner" id="modalInner">
+      <div id="mediaWrap"></div>
+      <div class="nav">
+        <button class="btn-ghost" onclick="prevMedia()">◀ Prev</button>
+        <button class="btn-ghost" onclick="nextMedia()">Next ▶</button>
+        <button class="btn-ghost" onclick="downloadMedia()">⬇ Download</button>
+        <button class="btn-ghost" onclick="closeModal()">Close ✕</button>
+      </div>
+    </div>
+  </div>
+
+  <footer id="status">Server status: <span id="statText">—</span></footer>
+
+  <script>
+    /*
+      Supercool frontend JS
+      - auto-detect API origin, fallback to given LAN IP
+      - supports API key stored in localStorage (X-API-KEY)
+      - uses thumbnail endpoint when available
+      - lazy-load via IntersectionObserver
+      - folder -> media navigation + breadcrumb
+      - modal viewer with keyboard navigation
+    */
+
+    const DEFAULT_API = "http://192.168.1.11:8000"; // fallback IP
+    const API = (function () {
+      try {
+        const origin = window.location.origin;
+        if (origin && origin.startsWith("http")) return origin;
+      } catch (e) { }
+      return DEFAULT_API;
+    })();
+
+    const grid = document.getElementById("grid");
+    const breadcrumbs = document.getElementById("breadcrumbs");
+    const statusText = document.getElementById("statText");
+    const searchInput = document.getElementById("search");
+
+    let currentFolder = null;
+    let currentList = []; // array of file objects shown (for modal navigation)
+    let currentIndex = 0;
+    let thumbnailsSupported = true; // we'll assume backend supports /thumbnail/
+    let apiKey = localStorage.getItem("MEDIA_API_KEY") || null;
+
+    // helper: smart encode of relpath preserving slashes
+    function encodeRel(rel) {
+      return rel.split("/").map(encodeURIComponent).join("/");
+    }
+
+    function headers() {
+      const h = { "Accept": "application/json" };
+      if (apiKey) h["X-API-KEY"] = apiKey;
+      return h;
+    }
+
+    async function apiGET(path) {
+      try {
+        const res = await fetch(API + path, { headers: headers() });
+        if (res.status === 401) {
+          statusText.textContent = "401 Unauthorized — set API key (🔑)";
+          return { __error: 401 };
+        }
+        if (!res.ok) {
+          const txt = await res.text();
+          console.warn("API error", res.status, txt);
+          statusText.textContent = `Error ${res.status}`;
+          return { __error: res.status, __text: txt };
+        }
+        return await res.json();
+      } catch (err) {
+        console.error("Fetch failed", err);
+        statusText.textContent = "Cannot reach backend at " + API;
+        return { __error: "network" };
+      }
+    }
+
+    /* UI actions */
+    document.getElementById("btnUpload").onclick = () => { document.getElementById('uploadModal').classList.add('show'); };
+    function closeUploadModal() { document.getElementById('uploadModal').classList.remove('show'); }
+
+    document.getElementById("startUpload").onclick = async () => {
+      const files = document.getElementById("fileInput").files;
+      const folder = document.getElementById("folderInput").value || "Uploads";
+
+      if (files.length === 0) return alert("Select files first");
+
+      statusText.textContent = `Uploading ${files.length} files...`;
+      const btn = document.getElementById("startUpload");
+      const originalText = btn.textContent;
+      btn.textContent = "Uploading...";
+      btn.disabled = true;
+
+      for (let file of files) {
+        const formData = new FormData();
+        formData.append("file", file);
+
+        let endpoint = "";
+
+        if (file.type.startsWith("image/")) {
+          endpoint = `/upload/photos/${encodeURIComponent(folder)}`;
+        } else if (file.type.startsWith("video/")) {
+          endpoint = `/upload/videos`;
+        } else {
+          // default to photos
+          endpoint = `/upload/photos/${encodeURIComponent(folder)}`;
+        }
+
+        try {
+          await fetch(API + endpoint, {
+            method: "POST",
+            headers: apiKey ? { "X-API-KEY": apiKey } : {},
+            body: formData
+          });
+        } catch (e) {
+          console.error("Upload error", e);
+        }
+      }
+
+      alert("Upload complete");
+      document.getElementById("fileInput").value = "";
+      btn.textContent = originalText;
+      btn.disabled = false;
+      closeUploadModal();
+
+      // Refresh current view
+      if (grid.classList.contains('folders')) {
+        loadFolders();
+      } else if (currentFolder) {
+        loadFolder(currentFolder);
+      } else {
+        loadVideos();
+      }
+    };
+
+    document.getElementById("btnFolders").onclick = () => { loadFolders(); };
+    document.getElementById("btnVideos").onclick = () => { loadVideos(); };
+    document.getElementById("toggleTheme").onclick = () => { document.body.classList.toggle("light"); };
+    document.getElementById("setKey").onclick = () => {
+      const k = prompt("Set MEDIA API KEY (leave empty to clear):", apiKey || "");
+      if (k === null) return;
+      apiKey = k || null;
+      if (apiKey) localStorage.setItem("MEDIA_API_KEY", apiKey);
+      else localStorage.removeItem("MEDIA_API_KEY");
+      alert(apiKey ? "Saved API key" : "Cleared API key");
+    }
+
+    /* lazy image loader */
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const img = entry.target;
+          const s = img.dataset.src;
+          if (s) { img.src = s; img.removeAttribute("data-src"); }
+          observer.unobserve(img);
+        }
+      });
+    }, { rootMargin: "200px 0px" });
+
+    /* core views */
+    async function loadFolders() {
+      breadcrumbs.textContent = "Home";
+      grid.className = "grid folders";
+      grid.innerHTML = `<div class="center">Loading folders…</div>`;
+      statusText.textContent = "loading folders";
+      const res = await apiGET("/folders/photos");
+      if (res.__error) { grid.innerHTML = `<div class="center">Error loading folders</div>`; return; }
+      grid.innerHTML = "";
+      if (!Array.isArray(res) || res.length === 0) {
+        grid.innerHTML = `<div class="center">No photo folders found in /media/photos</div>`;
+        return;
+      }
+      res.forEach(folder => {
+        const card = document.createElement("div");
+        card.className = "card";
+        const preview = folder.preview ? `${API}/thumbnail/${encodeRel(folder.preview)}` : "";
+        card.innerHTML = `
+      ${preview ? `<img class="thumb" loading="lazy" data-src="${preview}" alt="${folder.name}">` : `<div class="thumb center">No preview</div>`}
+      <div class="meta"><h3>${escapeHtml(folder.name)}</h3><p class="small">${folder.file_count} files • ${folder.size_human}</p></div>
+      <button class="menu-btn" onclick="toggleMenu(event, '${escapeHtml(folder.name)}')">⋮</button>
+      <div class="dropdown" id="menu-${escapeHtml(folder.name)}">
+          <button onclick="renameFolder(event, '${escapeHtml(folder.name)}')">✏️ Rename</button>
+          <button class="danger" onclick="deleteFolder(event, '${escapeHtml(folder.name)}')">🗑️ Delete</button>
+      </div>
+    `;
+        card.onclick = (e) => {
+          if (!e.target.closest('.menu-btn') && !e.target.closest('.dropdown')) {
+            loadFolder(folder.name);
+          }
+        };
+        grid.appendChild(card);
+        const img = card.querySelector("img");
+        if (img) observer.observe(img);
+      });
+      statusText.textContent = "folders loaded";
+    }
+
+    /* Context menu logic */
+    function toggleMenu(e, folderName) {
+      e.stopPropagation();
+      document.querySelectorAll('.dropdown.show').forEach(d => {
+        if (d.id !== `menu-${folderName}`) d.classList.remove('show');
+      });
+      document.getElementById(`menu-${folderName}`).classList.toggle('show');
+    }
+    window.addEventListener('click', () => {
+      document.querySelectorAll('.dropdown.show').forEach(d => d.classList.remove('show'));
+    });
+
+    async function renameFolder(e, oldName) {
+      e.stopPropagation();
+      document.getElementById(`menu-${oldName}`).classList.remove('show');
+      const newName = prompt(`Rename folder "${oldName}" to:`, oldName);
+      if (!newName || newName === oldName) return;
+
+      try {
+        const res = await fetch(`${API}/folders/photos/${encodeURIComponent(oldName)}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", ...headers() },
+          body: JSON.stringify({ new_name: newName })
+        });
+        if (res.ok) {
+          loadFolders();
+        } else {
+          const j = await res.json();
+          alert(j.detail || "Rename failed");
+        }
+      } catch (err) {
+        alert("Network error");
+      }
+    }
+
+    async function deleteFolder(e, folderName) {
+      e.stopPropagation();
+      document.getElementById(`menu-${folderName}`).classList.remove('show');
+      if (!confirm(`Are you sure you want to permanently delete folder "${folderName}" and ALL its contents?`)) return;
+
+      try {
+        const res = await fetch(`${API}/folders/photos/${encodeURIComponent(folderName)}`, {
+          method: "DELETE",
+          headers: headers()
+        });
+        if (res.ok) {
+          loadFolders();
+        } else {
+          const j = await res.json();
+          alert(j.detail || "Delete failed");
+        }
+      } catch (err) {
+        alert("Network error");
+      }
+    }
+
+    async function loadFolder(name) {
+      currentFolder = name;
+      breadcrumbs.textContent = `Home / ${name}`;
+      grid.className = "grid media";
+      grid.innerHTML = `<div class="center">Loading ${name}…</div>`;
+      statusText.textContent = "loading folder";
+      const res = await apiGET(`/files/photos/${encodeURIComponent(name)}?skip=0&limit=200`);
+      if (res.__error) { grid.innerHTML = `<div class="center">Error loading folder</div>`; return; }
+      grid.innerHTML = "";
+
+      const files = res.files || []; // accommodate new pagination wrapper
+      currentList = files.filter(r => r.mime && r.mime.startsWith("image/") || r.mime && r.mime.startsWith("video/"));
+      if (currentList.length === 0) { grid.innerHTML = `<div class="center">Folder empty</div>`; return; }
+      currentList.forEach((f, idx) => {
+        const isImage = f.mime && f.mime.startsWith("image/");
+        const relEnc = encodeRel(f.relpath);
+        const thumb = isImage ? `${API}/thumbnail/${relEnc}` : `${API}/thumbnail/${relEnc}`; // for videos backend might not support, fallback below
+        const div = document.createElement("div");
+        div.className = "card";
+        div.innerHTML = isImage
+          ? `<img class="thumb" loading="lazy" data-src="${thumb}" alt="${escapeHtml(f.name)}">`
+          : `<video class="thumb" preload="none" controlsList="nodownload"><source src="${API}/media/${relEnc}" type="${f.mime}"></video>`;
+        div.onclick = () => openModal(idx);
+        grid.appendChild(div);
+        const img = div.querySelector("img");
+        if (img) observer.observe(img);
+      });
+      statusText.textContent = "folder loaded";
+    }
+
+    /* video listing (all videos) */
+    async function loadVideos() {
+      breadcrumbs.textContent = "Videos";
+      grid.className = "grid media";
+      grid.innerHTML = `<div class="center" style="grid-column: 1/-1;">Loading videos…</div>`;
+      statusText.textContent = "loading videos";
+      const res = await apiGET("/files/videos?skip=0&limit=200");
+      if (res.__error) { grid.innerHTML = `<div class="center">Error loading videos</div>`; return; }
+      grid.innerHTML = "";
+
+      const files = res.files || [];
+      currentList = files;
+      if (!Array.isArray(files) || files.length === 0) { grid.innerHTML = `<div class="center">No videos found</div>`; return; }
+      files.forEach((f, idx) => {
+        const relEnc = encodeRel(f.relpath);
+        const div = document.createElement("div");
+        div.className = "card";
+        div.innerHTML = `<video class="thumb" preload="metadata" controls src="${API}/media/${relEnc}"></video>
+                     <div class="meta"><h3>${escapeHtml(f.name)}</h3><p class="small">${f.size_human}</p></div>`;
+        div.onclick = () => openModal(idx);
+        grid.appendChild(div);
+      });
+      statusText.textContent = "videos loaded";
+    }
+
+    /* search */
+    let searchTimeout = null;
+    searchInput.addEventListener("input", (e) => {
+      const q = e.target.value.trim();
+      if (searchTimeout) clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(() => performSearch(q), 300);
+    });
+    async function performSearch(q) {
+      if (!q) return loadFolders();
+      breadcrumbs.textContent = `Search: "${q}"`;
+      grid.className = "grid media";
+      grid.innerHTML = `<div class="center" style="grid-column: 1/-1;">Searching…</div>`;
+      statusText.textContent = "searching";
+      const res = await apiGET(`/search?q=${encodeURIComponent(q)}`);
+      if (res.__error) { grid.innerHTML = `<div class="center">Search error</div>`; return; }
+      grid.innerHTML = "";
+
+      const files = res.files || res; // depending on whether it's wrapped
+      currentList = files;
+      if (!files.length) { grid.innerHTML = `<div class="center">No results</div>`; return; }
+      files.forEach((f, idx) => {
+        const relEnc = encodeRel(f.relpath);
+        const isImage = f.mime && f.mime.startsWith("image/");
+        const div = document.createElement("div");
+        div.className = "card";
+        div.innerHTML = isImage
+          ? `<img class="thumb" loading="lazy" data-src="${API}/thumbnail/${relEnc}" alt="${escapeHtml(f.name)}">`
+          : `<video class="thumb" preload="metadata" controls src="${API}/media/${relEnc}"></video>`;
+        div.onclick = () => openModal(idx);
+        grid.appendChild(div);
+        const img = div.querySelector("img");
+        if (img) observer.observe(img);
+      });
+      statusText.textContent = "search done";
+    }
+
+    /* modal + viewer */
+    function showModal() {
+      document.getElementById('modal').classList.add('show');
+    }
+    function closeModal() {
+      document.getElementById('modal').classList.remove('show');
+      document.getElementById('mediaWrap').innerHTML = "";
+    }
+    function openModal(idx) {
+      currentIndex = idx;
+      renderModal();
+      showModal();
+    }
+    function prevMedia() {
+      if (currentList.length === 0) return;
+      currentIndex = (currentIndex - 1 + currentList.length) % currentList.length;
+      renderModal();
+    }
+    function nextMedia() {
+      if (currentList.length === 0) return;
+      currentIndex = (currentIndex + 1) % currentList.length;
+      renderModal();
+    }
+    function downloadMedia() {
+      const f = currentList[currentIndex];
+      if (!f) return;
+      const relEnc = encodeRel(f.relpath);
+      const url = API + "/media/" + relEnc;
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = f.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    function renderModal() {
+      const f = currentList[currentIndex];
+      if (!f) return;
+      const wrap = document.getElementById('mediaWrap');
+      wrap.innerHTML = "";
+      const relEnc = encodeRel(f.relpath);
+      if (f.mime && f.mime.startsWith("image/")) {
+        const img = document.createElement("img");
+        img.src = API + "/media/" + relEnc;
+        wrap.appendChild(img);
+      } else if (f.mime && f.mime.startsWith("video/")) {
+        const v = document.createElement("video");
+        v.controls = true; v.autoplay = true; v.src = API + "/media/" + relEnc;
+        wrap.appendChild(v);
+      } else {
+        wrap.innerHTML = `<div class="center">Cannot preview this file</div>`;
+      }
+    }
+
+    /* keyboard nav */
+    window.addEventListener("keydown", (e) => {
+      if (document.getElementById('modal').classList.contains('show')) {
+        if (e.key === "ArrowLeft") prevMedia();
+        if (e.key === "ArrowRight") nextMedia();
+        if (e.key === "Escape") closeModal();
+      }
+    });
+
+    /* utilities */
+    function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+    /* initial health check + start */
+    async function init() {
+      statusText.textContent = "checking backend...";
+      const h = await apiGET("/health");
+      if (h && !h.__error) {
+        statusText.textContent = "backend OK — " + (h.time || "");
+        // show folders by default
+        loadFolders();
+      } else {
+        statusText.textContent = "backend unreachable: " + API;
+        // still try to show folders so the user sees an error in-page
+        loadFolders();
+      }
+    }
+    init();
+
+  </script>
+</body>
+
+</html>
