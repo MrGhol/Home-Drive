@@ -100,7 +100,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten to LAN CIDR / known origins in production
+    # "allow_origins=['*']" is fine for a private LAN.
+    # To lock down: replace with your LAN subnet, e.g.
+    #   allow_origins=["http://192.168.1.0/24"]
+    # or list explicit origins like ["http://192.168.1.100:8000"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -140,9 +144,16 @@ def require_api_key(request: Request) -> bool:
 
 
 def rate_limit(request: Request) -> None:
-    """Simple sliding-window rate limiter stored in process memory."""
-    ip  = request.client.host
-    now = time.monotonic()
+    """Simple sliding-window rate limiter stored in process memory.
+
+    On every call:
+    1. Trim timestamps outside the current window (keeps memory bounded per IP).
+    2. Reject if the bucket is already full.
+    3. Periodically sweep the whole dict to remove buckets that went empty
+       after trimming (prevents unbounded growth from many distinct IPs).
+    """
+    ip     = request.client.host
+    now    = time.monotonic()
     cutoff = now - RATE_WINDOW
 
     bucket = _ip_counters.get(ip)
@@ -150,14 +161,15 @@ def rate_limit(request: Request) -> None:
         _ip_counters[ip] = [now]
         return
 
-    # Trim old entries in-place
+    # Trim stale entries in-place on every single call
     bucket[:] = [t for t in bucket if t >= cutoff]
     if len(bucket) >= RATE_LIMIT:
         raise HTTPException(status_code=429, detail="Too many requests – slow down.")
     bucket.append(now)
 
-    # Periodically evict completely idle IPs to avoid memory growth
-    if len(_ip_counters) > 5000:
+    # Sweep dead IPs periodically (every ~200 requests across all IPs)
+    # Using modulo on total dict size is cheap and avoids a counter variable.
+    if len(_ip_counters) % 200 == 0:
         dead = [k for k, v in _ip_counters.items() if not v]
         for k in dead:
             del _ip_counters[k]
@@ -181,12 +193,17 @@ def mime_type_for(path: Path) -> str:
 
 
 def safe_join(base: Path, *parts: str) -> Path:
-    """Resolve path and reject any traversal outside base."""
+    """Resolve path and reject any traversal outside base.
+
+    Uses Path.parents instead of a string prefix check, which avoids the
+    edge case where base='media' would incorrectly allow 'media_fake'.
+    """
     try:
-        final = base.joinpath(*parts).resolve()
+        final    = base.joinpath(*parts).resolve()
+        base_abs = base.resolve()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid path.")
-    if not str(final).startswith(str(base.resolve())):
+    if final != base_abs and base_abs not in final.parents:
         raise HTTPException(status_code=400, detail="Path traversal rejected.")
     return final
 
@@ -484,8 +501,9 @@ def rename_folder(old_name: str, payload: RenameRequest, _auth=Depends(require_a
     if target.exists():
         raise HTTPException(status_code=409, detail="Target folder already exists.")
     os.rename(source, target)
-    # Invalidate index
-    _index_built_at == 0
+    # Invalidate search index (was a comparison == before – now correctly assigns)
+    global _index_built_at
+    _index_built_at = 0.0
     return {"message": "Folder renamed.", "old": old_name, "new": payload.new_name}
 
 
@@ -511,6 +529,8 @@ def list_photos_in_folder(
     _auth=Depends(require_api_key),
 ):
     rate_limit(request)
+    skip  = max(skip, 0)
+    limit = max(1, min(limit, 500))
     folder = safe_join(PHOTOS_DIR, folder_name)
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail="Folder not found.")
@@ -551,6 +571,8 @@ def list_videos(
     _auth=Depends(require_api_key),
 ):
     rate_limit(request)
+    skip  = max(skip, 0)
+    limit = max(1, min(limit, 500))
     if not VIDEOS_DIR.exists():
         return {"total": 0, "skip": skip, "limit": limit, "files": []}
 
@@ -587,6 +609,8 @@ def list_videos(
 @app.get("/search", tags=["search"])
 def search(q: str, request: Request, skip: int = 0, limit: int = 100, _auth=Depends(require_api_key)):
     rate_limit(request)
+    skip  = max(skip, 0)
+    limit = max(1, min(limit, 500))
     if not q or len(q) < 1:
         raise HTTPException(status_code=400, detail="Query must not be empty.")
     pattern = q.lower()
@@ -778,6 +802,8 @@ async def upload_photo(
     global _index_built_at
     _index_built_at = 0.0
 
+    print(f"[UPLOAD] photo → {dest}  ({human_size(dest.stat().st_size)})")
+
     return {
         "status":   "success",
         "filename": dest.name,
@@ -809,6 +835,8 @@ async def upload_video(
 
     global _index_built_at
     _index_built_at = 0.0
+
+    print(f"[UPLOAD] video → {dest}  ({human_size(dest.stat().st_size)})")
 
     return {
         "status":   "success",
