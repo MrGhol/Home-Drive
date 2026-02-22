@@ -163,6 +163,13 @@ def rate_limit(request: Request) -> None:
 
     # Trim stale entries in-place on every single call
     bucket[:] = [t for t in bucket if t >= cutoff]
+
+    # If the bucket drained to empty (IP was idle), evict it right now.
+    if not bucket:
+        del _ip_counters[ip]
+        _ip_counters[ip] = [now]
+        return
+
     if len(bucket) >= RATE_LIMIT:
         raise HTTPException(status_code=429, detail="Too many requests – slow down.")
     bucket.append(now)
@@ -195,15 +202,17 @@ def mime_type_for(path: Path) -> str:
 def safe_join(base: Path, *parts: str) -> Path:
     """Resolve path and reject any traversal outside base.
 
-    Uses Path.parents instead of a string prefix check, which avoids the
-    edge case where base='media' would incorrectly allow 'media_fake'.
+    Uses Path.is_relative_to() (Python 3.9+) which is the canonical,
+    symlink-aware way to assert filesystem ancestry.
+    Fallback for 3.8: `base_abs not in final.parents and final != base_abs`
     """
     try:
         final    = base.joinpath(*parts).resolve()
         base_abs = base.resolve()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid path.")
-    if final != base_abs and base_abs not in final.parents:
+    # is_relative_to covers both "final == base" and "base is a parent of final"
+    if not final.is_relative_to(base_abs):
         raise HTTPException(status_code=400, detail="Path traversal rejected.")
     return final
 
@@ -530,7 +539,7 @@ def list_photos_in_folder(
 ):
     rate_limit(request)
     skip  = max(skip, 0)
-    limit = max(1, min(limit, 500))
+    limit = max(1, min(limit, 200))
     folder = safe_join(PHOTOS_DIR, folder_name)
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=404, detail="Folder not found.")
@@ -572,7 +581,7 @@ def list_videos(
 ):
     rate_limit(request)
     skip  = max(skip, 0)
-    limit = max(1, min(limit, 500))
+    limit = max(1, min(limit, 200))
     if not VIDEOS_DIR.exists():
         return {"total": 0, "skip": skip, "limit": limit, "files": []}
 
@@ -610,7 +619,7 @@ def list_videos(
 def search(q: str, request: Request, skip: int = 0, limit: int = 100, _auth=Depends(require_api_key)):
     rate_limit(request)
     skip  = max(skip, 0)
-    limit = max(1, min(limit, 500))
+    limit = max(1, min(limit, 200))
     if not q or len(q) < 1:
         raise HTTPException(status_code=400, detail="Query must not be empty.")
     pattern = q.lower()
