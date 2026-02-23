@@ -659,7 +659,12 @@ def get_thumb_path(relpath: str) -> Path:
 def _generate_image_thumb_sync(src: Path, out: Path) -> None:
     with Image.open(src) as im:
         im.load()
-        im = ImageOps.exif_transpose(im)
+        try:
+            im = ImageOps.exif_transpose(im)   # fix orientation from EXIF
+        except Exception as exc:
+            # Broken EXIF block – log and continue with the raw image rather
+            # than failing the whole thumbnail request.
+            print(f"[Thumbnail] EXIF transpose warning for {src.name}: {exc}")
         if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
         im.thumbnail(THUMB_SIZE, Image.LANCZOS)
@@ -965,9 +970,16 @@ async def thumbnail_image(
             return FileResponse(thumb, media_type="image/webp")
         try:
             await run_in_threadpool(_generate_image_thumb_sync, target, thumb)
-        except Exception:
+        except Exception as exc:
             thumb.unlink(missing_ok=True)   # discard any half-written file
+            print(f"[Thumbnail] Pillow error for {target.name}: {exc}")
+            _thumb_locks.pop(cache_key, None)
+            if FALLBACK_THUMB.exists():
+                return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
             raise HTTPException(status_code=500, detail="Thumbnail generation failed.")
+        finally:
+            # Release lock entry to prevent unbounded dict growth.
+            _thumb_locks.pop(cache_key, None)
 
     if thumb.exists():
         return FileResponse(thumb, media_type="image/webp")
@@ -1014,15 +1026,16 @@ async def thumbnail_video(
         thumb.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
             "ffmpeg", "-y",
-            "-ss", "00:00:01",          # seek 1 s in – frame 0 is often black
+            "-ss", "00:00:00.5",    # 0.5 s seek – avoids black frame 0, safe for short clips
             "-i", str(src),
             "-vframes", "1",
             "-vf", (
                 f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)'"
                 f":force_original_aspect_ratio=decrease"
-                f",autorotate"           # honour rotation metadata in one filter chain
+                f",autorotate"      # honour rotation metadata in one filter chain
             ),
-            "-f", "image2", str(thumb),
+            "-vcodec", "libwebp",   # explicitly force WebP – avoids mime/format mismatch
+            str(thumb),
         ]
         try:
             await run_in_threadpool(
@@ -1030,9 +1043,17 @@ async def thumbnail_video(
                 stderr=subprocess.STDOUT,
                 timeout=30,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             thumb.unlink(missing_ok=True)   # discard any half-written file
+            print(f"[Thumbnail] ffmpeg error for {src.name}: {exc}")
+            _thumb_locks.pop(cache_key, None)
+            if FALLBACK_THUMB.exists():
+                return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
             raise HTTPException(status_code=500, detail="ffmpeg failed to generate a thumbnail.")
+        finally:
+            # Release the lock entry so the dict doesn't grow without bound.
+            # Any concurrent waiters that got through will regenerate if needed.
+            _thumb_locks.pop(cache_key, None)
 
     if thumb.exists():
         return FileResponse(thumb, media_type="image/webp")
