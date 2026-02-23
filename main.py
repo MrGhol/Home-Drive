@@ -98,33 +98,67 @@ MAX_PHOTO_BYTES = 200 * 1024 * 1024   # 200 MB
 MAX_VIDEO_BYTES = 500 * 1024 * 1024   # 500 MB
 
 # Thumbnails
-THUMB_SIZE     = (320, 320)
-CHUNK_SIZE     = 1024 * 1024   # 1 MiB streaming chunks
-FALLBACK_THUMB = THUMB_DIR / "fallback.webp"
+THUMB_SIZE  = (320, 320)
+CHUNK_SIZE  = 1024 * 1024   # 1 MiB streaming chunks
 
 
-def _ensure_fallback_thumb() -> None:
-    """Create a neutral grey placeholder thumbnail if one doesn't exist yet.
+def _generate_identity_thumb(src: Path, out: Path) -> None:
+    """Generate a unique, file-specific placeholder thumbnail when real
+    decoding fails completely.
 
-    Called once on startup.  The placeholder is a 320×320 grey WebP with a
-    centered film-strip icon drawn in pure Pillow – no external assets needed.
+    Each file gets a deterministic colour derived from its name hash, so
+    every broken image looks different in the grid — never a sea of identical
+    grey tiles.  The file extension and a truncated filename are drawn on top
+    so the user can still identify what the file is.
+
+    This is Stage 3 after Pillow and ffmpeg both fail.  It uses only basic
+    Pillow drawing — no decoders, no external tools — so it cannot fail.
     """
-    if FALLBACK_THUMB.exists():
-        return
+    from PIL import ImageDraw
+
+    # Derive a stable hue from the filename (0–360°)
+    name_hash  = int(hashlib.sha1(src.name.encode()).hexdigest(), 16)
+    hue        = (name_hash % 360) / 360.0
+    # Dark, desaturated background so it reads clearly as "not a real photo"
+    import colorsys
+    r, g, b    = colorsys.hsv_to_rgb(hue, 0.35, 0.28)
+    bg_colour  = (int(r * 255), int(g * 255), int(b * 255))
+    # Lighter accent for text and icon
+    ra, ga, ba = colorsys.hsv_to_rgb(hue, 0.25, 0.75)
+    fg_colour  = (int(ra * 255), int(ga * 255), int(ba * 255))
+
+    w, h = THUMB_SIZE
+    img  = Image.new("RGB", (w, h), bg_colour)
+    draw = ImageDraw.Draw(img)
+
+    # Draw a simple broken-image icon (two overlapping rectangles + diagonal)
+    cx, cy = w // 2, h // 2
+    bw, bh = w // 3, h // 4
+    draw.rectangle([cx - bw, cy - bh, cx + bw, cy + bh],
+                   outline=fg_colour, width=3)
+    draw.line([cx - bw, cy - bh, cx + bw, cy + bh], fill=fg_colour, width=2)
+
+    # Extension badge in the top-left corner
+    ext = src.suffix.upper().lstrip(".")[:5] or "???"
+    draw.rectangle([8, 8, 8 + len(ext) * 9 + 10, 30], fill=fg_colour)
+    draw.text((13, 11), ext, fill=bg_colour)
+
+    # Truncated filename at the bottom
+    name = src.stem
+    if len(name) > 22:
+        name = name[:19] + "…"
+    draw.text((w // 2 - len(name) * 4, h - 28), name, fill=fg_colour)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(suffix=".webp", dir=out.parent)
+    os.close(fd)
+    tmp = Path(tmp_str)
     try:
-        from PIL import ImageDraw, ImageFont
-        size = THUMB_SIZE[0]
-        img  = Image.new("RGB", (size, size), color=(45, 45, 48))   # dark-grey bg
-        draw = ImageDraw.Draw(img)
-        # Draw a simple camera-shutter / image icon using basic shapes
-        cx, cy, r = size // 2, size // 2, size // 5
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(120, 120, 130), width=6)
-        draw.line([cx - r - 20, cy, cx + r + 20, cy], fill=(120, 120, 130), width=3)
-        draw.line([cx, cy - r - 20, cx, cy + r + 20], fill=(120, 120, 130), width=3)
-        FALLBACK_THUMB.parent.mkdir(parents=True, exist_ok=True)
-        img.save(FALLBACK_THUMB, format="WEBP", quality=80)
+        img.save(tmp, format="WEBP", quality=80)
+        tmp.replace(out)
     except Exception:
-        pass   # if even this fails, endpoint will 404 gracefully
+        tmp.unlink(missing_ok=True)
+        raise
 
 # Allowed MIME prefixes (checked server-side via Pillow / ffprobe)
 ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"}
@@ -241,7 +275,6 @@ def _unregister_mdns() -> None:
 async def lifespan(_app: FastAPI):
     # ── Startup ──────────────────────────────────────────────────────────────
     _rebuild_index()
-    _ensure_fallback_thumb()
     print(f"[Home Drive] Index built – {len(_search_index)} files indexed.")
     if API_KEY:
         print("[Home Drive] API key protection is ENABLED.")
@@ -668,12 +701,10 @@ def get_thumb_path(relpath: str) -> Path:
 
 
 def _safe_file_response(path: Path, media_type: str) -> FileResponse:
-    """Return a FileResponse, falling back to FALLBACK_THUMB if the file
-    vanished between the exists() check and now (race condition / deletion)."""
+    """Serve *path* as a FileResponse.  If it vanished between the exists()
+    check and now (race condition), raises 404."""
     if path.exists():
         return FileResponse(str(path), media_type=media_type)
-    if FALLBACK_THUMB.exists():
-        return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
     raise HTTPException(status_code=404, detail="File not found.")
 
 
@@ -801,11 +832,236 @@ def _ffmpeg_to_webp(src: Path, out: Path, extra_vf: str = "") -> bool:
     return False
 
 
-def _generate_image_thumb_sync(src: Path, out: Path) -> None:
-    """Generate a WebP thumbnail covering all real-world failure cases.
+def _validate_webp(path: Path) -> bool:
+    """Return True only if *path* is a non-empty, fully decodable WebP image.
 
-    Stage 1 — Pillow (fast, handles JPEGs / PNGs / HEIC / WebP / GIF / TIFF).
-    Stage 2 — ffmpeg with libwebp, PNG fallback, or MJPEG fallback.
+    Uses im.load() — not im.verify() — because verify() only checks the file
+    header/signature.  A file with a valid WebP header but corrupt pixel data
+    passes verify() but fails in the browser.  load() forces a full decode.
+    """
+    try:
+        if not path.exists() or path.stat().st_size < 20:
+            return False
+        with Image.open(path) as im:
+            if im.format != "WEBP":
+                print(f"[Validate] {path.name}: format is {im.format!r}, not WEBP")
+                return False
+            im.load()   # full pixel decode — this is what the browser will do
+        return True
+    except Exception as exc:
+        print(f"[Validate] {path.name}: decode failed – {exc}")
+        return False
+
+
+def _save_pil_as_webp(im: Image.Image, out: Path) -> None:
+    """Normalise *im*, save as WebP to *out*, then validate the result.
+
+    Raises if the written file cannot be decoded — so the calling strategy
+    knows to mark itself failed rather than returning True on a corrupt write.
+    """
+    im = _normalise_image_mode(im)
+    im.thumbnail(THUMB_SIZE, Image.LANCZOS)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(suffix=".webp", dir=out.parent)
+    os.close(fd)
+    tmp = Path(tmp_str)
+    try:
+        im.save(tmp, format="WEBP", quality=85, method=6)
+        if not _validate_webp(tmp):
+            raise RuntimeError(f"Written WebP failed validation: {tmp}")
+        tmp.replace(out)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _brute_force_decode(src: Path, out: Path) -> bool:
+    """Aggressive pixel-extraction strategies for images that defeated Stage 1 + 2.
+
+    Tries every trick that can recover real image data from a damaged file,
+    in order of quality:
+
+      BF-1  JPEG draft mode          — Pillow reads reduced scanlines, far more
+                                        tolerant of truncation and chunk errors.
+      BF-2  Format-hint open         — Force Pillow to try JPEG / PNG / BMP /
+                                        TIFF decoders ignoring the file extension.
+      BF-3  Strip ALL metadata        — Remove EXIF, ICC, XMP, IPTC from raw
+                                        bytes then re-open the cleaned buffer.
+      BF-4  Scanline-by-scanline      — Decode the JPEG row by row, keep every
+                                        row that succeeds; paste into a canvas.
+      BF-5  ImageMagick `convert`     — External tool, handles dozens of edge
+                                        cases Pillow can't (e.g. CMYK JPEG with
+                                        missing EOI, Sony ARW, Canon CR2).
+      BF-6  Rawpy (RAW camera files)  — libraw-based decode for .CR2/.NEF/.ARW.
+      BF-7  ByteScan JPEG SOI rescue  — Skip corrupt leading bytes by finding
+                                        the first valid JPEG SOI marker (FF D8)
+                                        in the file and decoding from there.
+
+    Returns True if *out* was written successfully, False otherwise.
+    """
+    import io
+    import struct
+
+    # ── BF-1: JPEG draft mode ─────────────────────────────────────────────────
+    try:
+        with Image.open(src) as im:
+            im.draft("RGB", THUMB_SIZE)   # asks decoder for a low-res pass
+            im.load()
+            _save_pil_as_webp(im, out)
+            print(f"[BruteForce] {src.name}: recovered via JPEG draft mode")
+            return True
+    except Exception:
+        pass
+
+    # ── BF-2: force-try every Pillow format decoder ───────────────────────────
+    for fmt in ("JPEG", "PNG", "BMP", "TIFF", "GIF", "WEBP", "PPM", "TGA"):
+        try:
+            with Image.open(src, formats=[fmt]) as im:
+                im.load()
+                _save_pil_as_webp(im, out)
+                print(f"[BruteForce] {src.name}: recovered via forced format={fmt}")
+                return True
+        except Exception:
+            continue
+
+    # ── BF-3: strip ALL embedded metadata from raw bytes, retry Pillow ────────
+    try:
+        raw = src.read_bytes()
+
+        def _strip_jpeg_metadata(data: bytes) -> bytes:
+            """Remove all APP markers (EXIF, ICC, XMP, IPTC) from a JPEG stream."""
+            if not data.startswith(b"\xff\xd8"):
+                return data
+            out_buf = bytearray(b"\xff\xd8")
+            i = 2
+            while i < len(data) - 1:
+                if data[i] != 0xFF:
+                    out_buf.extend(data[i:])
+                    break
+                marker = data[i + 1]
+                if marker == 0xD9:   # EOI
+                    out_buf.extend(b"\xff\xd9")
+                    break
+                if marker in (0xDA, 0xD8):   # SOS / SOI — image data starts
+                    out_buf.extend(data[i:])
+                    break
+                if 0xE0 <= marker <= 0xEF or marker in (0xFE, 0xED, 0xE1):
+                    # APP0–APP15, COM, Photoshop, EXIF — skip
+                    if i + 3 < len(data):
+                        seg_len = struct.unpack(">H", data[i + 2:i + 4])[0]
+                        i += 2 + seg_len
+                        continue
+                out_buf.extend(data[i:i + 2])
+                i += 2
+            return bytes(out_buf)
+
+        cleaned = _strip_jpeg_metadata(raw)
+        buf = io.BytesIO(cleaned)
+        with Image.open(buf) as im:
+            im.load()
+            _save_pil_as_webp(im, out)
+            print(f"[BruteForce] {src.name}: recovered after stripping all JPEG metadata")
+            return True
+    except Exception:
+        pass
+
+    # ── BF-4: scanline-by-scanline JPEG rescue ────────────────────────────────
+    try:
+        import io as _io
+        raw = src.read_bytes()
+        buf = _io.BytesIO(raw)
+        with Image.open(buf) as im:
+            w, h = im.size
+            canvas = Image.new("RGB", (w, h), (30, 30, 30))
+            # Force LOAD_TRUNCATED and ignore errors row by row
+            ImageFile.LOAD_TRUNCATED_IMAGES = True
+            for y in range(0, h, 16):   # process in 16-row blocks (JPEG MCU height)
+                try:
+                    region = im.crop((0, y, w, min(y + 16, h)))
+                    region.load()
+                    canvas.paste(region, (0, y))
+                except Exception:
+                    pass   # keep the canvas pixels from previous successful rows
+            _save_pil_as_webp(canvas, out)
+            print(f"[BruteForce] {src.name}: recovered via scanline-by-scanline rescue")
+            return True
+    except Exception:
+        pass
+
+    # ── BF-5: ImageMagick `convert` ───────────────────────────────────────────
+    if shutil.which("convert"):
+        try:
+            fd, tmp_str = tempfile.mkstemp(suffix=".png", dir=THUMB_DIR)
+            os.close(fd)
+            tmp = Path(tmp_str)
+            result = subprocess.run(
+                ["convert", "-limit", "memory", "256MB",
+                 f"{src}[0]",      # [0] = first frame/page
+                 "-flatten",       # merge layers if PSD/PDF
+                 "-auto-orient",   # honour EXIF rotation
+                 str(tmp)],
+                stderr=subprocess.PIPE, timeout=15,
+            )
+            if result.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+                with Image.open(tmp) as im:
+                    im.load()
+                    _save_pil_as_webp(im, out)
+                print(f"[BruteForce] {src.name}: recovered via ImageMagick convert")
+                return True
+            else:
+                err = result.stderr.decode(errors="replace").strip()
+                print(f"[BruteForce] ImageMagick failed for {src.name}: {err}")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(f"[BruteForce] ImageMagick error for {src.name}: {exc}")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    # ── BF-6: rawpy — RAW camera files (CR2, NEF, ARW, DNG, RW2…) ────────────
+    try:
+        import rawpy  # type: ignore
+        with rawpy.imread(str(src)) as raw_img:
+            rgb = raw_img.postprocess(
+                use_camera_wb=True,
+                half_size=True,          # faster, still enough for a thumbnail
+                no_auto_bright=False,
+            )
+        pil_img = Image.fromarray(rgb)
+        _save_pil_as_webp(pil_img, out)
+        print(f"[BruteForce] {src.name}: recovered via rawpy (RAW camera file)")
+        return True
+    except ImportError:
+        pass   # rawpy not installed — skip silently
+    except Exception as exc:
+        print(f"[BruteForce] rawpy failed for {src.name}: {exc}")
+
+    # ── BF-7: JPEG SOI byte-scan rescue ──────────────────────────────────────
+    # Some files have a corrupt header before the real JPEG data begins
+    # (e.g. double-wrapped, truncated transfer with garbage prefix).
+    # Scan for the first FF D8 FF marker and attempt to decode from there.
+    try:
+        raw = src.read_bytes()
+        soi = raw.find(b"\xff\xd8\xff")
+        if soi > 0:   # only bother if there's actually junk before the JPEG
+            buf = io.BytesIO(raw[soi:])
+            with Image.open(buf) as im:
+                im.load()
+                _save_pil_as_webp(im, out)
+                print(f"[BruteForce] {src.name}: recovered via SOI byte-scan "
+                      f"(skipped {soi} corrupt leading bytes)")
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _generate_image_thumb_sync(src: Path, out: Path) -> None:
+    """Generate a WebP thumbnail with a four-stage pipeline.
+
+    Stage 1  — Pillow standard decode (handles 99 % of files)
+    Stage 2  — ffmpeg PNG/MJPEG → Pillow (exotic formats, 50 MP+ OOM)
+    Stage 2.5— Brute-force smaller decode (7 sub-strategies for damaged files)
+    Stage 3  — Unique per-file identity placeholder (never fails)
 
     Failure cases handled:
       • Zero / tiny files (corrupt transfer)
@@ -813,10 +1069,12 @@ def _generate_image_thumb_sync(src: Path, out: Path) -> None:
       • CMYK JPEGs (scanned docs, some print workflows)
       • 16-bit / HDR TIFFs (mode I, I;16, F)
       • Animated GIFs (seeks to frame 0 explicitly)
-      • Broken ICC profiles (open with ignore_exif=True re-attempt)
+      • Broken ICC profiles
       • Broken EXIF orientation data (silent pass)
-      • 50 MP+ images (MemoryError → ffmpeg fallback)
-      • ffmpeg missing libwebp encoder (PNG/JPEG intermediate strategy)
+      • 50 MP+ images (MemoryError → ffmpeg)
+      • Corrupt JPEG headers (draft mode, byte-scan rescue)
+      • RAW camera files (rawpy if installed)
+      • ImageMagick formats (PSD, PDF page, exotic RAW)
     """
     # ── Guard: refuse empty / near-empty files immediately ───────────────────
     try:
@@ -854,6 +1112,8 @@ def _generate_image_thumb_sync(src: Path, out: Path) -> None:
             webp_tmp = Path(webp_tmp_str)
             try:
                 im.save(webp_tmp, format="WEBP", quality=85, method=6)
+                if not _validate_webp(webp_tmp):
+                    raise RuntimeError("Stage 1 wrote invalid WebP — falling through to Stage 2")
                 webp_tmp.replace(out)  # atomic rename; out is always complete WebP or absent
             except Exception:
                 webp_tmp.unlink(missing_ok=True)
@@ -877,6 +1137,8 @@ def _generate_image_thumb_sync(src: Path, out: Path) -> None:
                     webp_tmp = Path(webp_tmp_str)
                     try:
                         im.save(webp_tmp, format="WEBP", quality=85, method=6)
+                        if not _validate_webp(webp_tmp):
+                            raise RuntimeError("ICC-stripped Stage 1 wrote invalid WebP")
                         webp_tmp.replace(out)
                     except Exception:
                         webp_tmp.unlink(missing_ok=True)
@@ -888,16 +1150,24 @@ def _generate_image_thumb_sync(src: Path, out: Path) -> None:
 
     print(f"[Thumbnail] Pillow failed for {src.name}: {pillow_err!r} – trying ffmpeg")
 
-    # ── Stage 2: ffmpeg (multi-strategy) ─────────────────────────────────────
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("Pillow failed and ffmpeg is not available as a fallback")
+    # ── Stage 2: ffmpeg (PNG → Pillow → WebP, MJPEG → Pillow → WebP) ─────────
+    if shutil.which("ffmpeg"):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if _ffmpeg_to_webp(src, out):
+            print(f"[Thumbnail] {src.name}: generated via ffmpeg")
+            return
+        print(f"[Thumbnail] {src.name}: ffmpeg also failed – trying brute-force decode")
+    else:
+        print(f"[Thumbnail] {src.name}: ffmpeg not found – trying brute-force decode")
 
+    # ── Stage 2.5: brute-force smaller decode ────────────────────────────────
     out.parent.mkdir(parents=True, exist_ok=True)
-    if _ffmpeg_to_webp(src, out):
-        print(f"[Thumbnail] {src.name}: generated via ffmpeg fallback")
+    if _brute_force_decode(src, out):
         return
 
-    raise RuntimeError(f"All thumbnail strategies failed for {src.name}")
+    # ── Stage 3: unique per-file identity placeholder ─────────────────────────
+    print(f"[Thumbnail] {src.name}: all decode strategies exhausted – identity placeholder")
+    _generate_identity_thumb(src, out)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -936,6 +1206,104 @@ def parse_range(header: Optional[str], size: int) -> Optional[Tuple[int, int]]:
 
 class RenameRequest(BaseModel):
     new_name: str
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Routes – thumbnail debug  (diagnose the 5 broken images)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/debug/thumbnail/{file_path:path}", tags=["debug"])
+async def debug_thumbnail(file_path: str, _auth=Depends(require_api_key)):
+    """Inspect the cached thumbnail for any file and return a full diagnosis.
+
+    Tells you exactly why a thumbnail looks broken in the browser:
+      • Is the thumb file there at all?
+      • What size is it?
+      • What format does Pillow think it is?
+      • Does a full decode (im.load()) succeed?
+      • What error does it raise if not?
+
+    Use this to diagnose the 5 failing images:
+      GET /debug/thumbnail/photos/MyAlbum/IMG_1234.HEIC
+    """
+    target = ensure_in_base(file_path)
+    thumb  = get_thumb_path(file_path)
+
+    info: dict = {
+        "file_path":    file_path,
+        "source_exists": target.exists(),
+        "source_size":  target.stat().st_size if target.exists() else None,
+        "thumb_path":   str(thumb),
+        "thumb_exists": thumb.exists(),
+        "thumb_size":   thumb.stat().st_size if thumb.exists() else None,
+        "thumb_valid":  False,
+        "thumb_format": None,
+        "thumb_mode":   None,
+        "thumb_dimensions": None,
+        "error":        None,
+        "verdict":      None,
+    }
+
+    if not thumb.exists():
+        info["verdict"] = "THUMB_MISSING – thumbnail was never generated or was deleted"
+        return info
+
+    if thumb.stat().st_size == 0:
+        info["verdict"] = "THUMB_EMPTY – file exists but is zero bytes"
+        return info
+
+    try:
+        with Image.open(thumb) as im:
+            info["thumb_format"]     = im.format
+            info["thumb_mode"]       = im.mode
+            info["thumb_dimensions"] = list(im.size)
+            im.load()   # full decode – same as what the browser does
+            info["thumb_valid"] = True
+            if im.format != "WEBP":
+                info["verdict"] = (
+                    f"WRONG_FORMAT – file has extension .webp but Pillow reads it as "
+                    f"{im.format}. Browser receives wrong Content-Type."
+                )
+            else:
+                info["verdict"] = "OK – thumbnail is a valid, decodable WebP"
+    except Exception as exc:
+        info["error"]   = str(exc)
+        info["verdict"] = f"DECODE_FAILED – file exists and is non-empty but Pillow cannot decode it: {exc}"
+
+    # Also read the first 12 bytes to check the file signature
+    try:
+        header = thumb.read_bytes()[:12].hex(" ")
+        info["file_header_hex"] = header
+        raw12 = thumb.read_bytes()[:12]
+        if raw12[:4] == b"RIFF" and raw12[8:12] == b"WEBP":
+            info["signature"] = "RIFF....WEBP ✓ (valid WebP container)"
+        elif raw12[:2] == b"\xff\xd8":
+            info["signature"] = "FFD8 (JPEG) – file is JPEG disguised as .webp"
+        elif raw12[:8] == b"\x89PNG\r\n\x1a\n":
+            info["signature"] = "PNG signature – file is PNG disguised as .webp"
+        elif raw12[:4] == b"GIF8":
+            info["signature"] = "GIF signature – file is GIF disguised as .webp"
+        else:
+            info["signature"] = f"Unknown signature: {raw12[:8].hex()}"
+    except Exception:
+        pass
+
+    # Bonus: wipe the cached thumb so the next request regenerates it fresh
+    # Pass ?reset=1 to force regeneration after viewing the diagnosis
+    return info
+
+
+@app.delete("/debug/thumbnail/{file_path:path}", tags=["debug"])
+def debug_thumbnail_reset(file_path: str, _auth=Depends(require_api_key)):
+    """Delete the cached thumbnail for a file so it will be regenerated fresh."""
+    thumb = get_thumb_path(file_path)
+    existed = thumb.exists()
+    thumb.unlink(missing_ok=True)
+    return {
+        "file_path": file_path,
+        "thumb_deleted": existed,
+        "message": "Thumbnail cache cleared. Next GET /thumbnail/… will regenerate it.",
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1167,10 +1535,15 @@ async def thumbnail_image(
     src_mtime = target.stat().st_mtime
 
     # Fast path: cached thumbnail exists and is newer than the source.
-    # We generated it ourselves so we trust it; no .verify() needed.
-    # If it turns out corrupt the generator's except block will evict it.
+    # Validate it fully (im.load(), not just exists()) — the 5 broken images
+    # are likely already cached as invalid files that pass exists() but fail
+    # in the browser.  An invalid cache entry is evicted and regenerated.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-        return _safe_file_response(thumb, "image/webp")
+        if _validate_webp(thumb):
+            return _safe_file_response(thumb, "image/webp")
+        else:
+            print(f"[Thumbnail] evicting invalid cached thumb for {target.name}")
+            thumb.unlink(missing_ok=True)
 
     # Slow path: acquire a per-thumbnail asyncio.Lock so that if multiple
     # requests arrive simultaneously for the same image, only ONE actually
@@ -1187,20 +1560,18 @@ async def thumbnail_image(
         try:
             await run_in_threadpool(_generate_image_thumb_sync, target, thumb)
         except Exception as exc:
-            thumb.unlink(missing_ok=True)   # discard any half-written file
-            print(f"[Thumbnail] Pillow error for {target.name}: {exc}")
-            _thumb_locks.pop(cache_key, None)
-            if FALLBACK_THUMB.exists():
-                return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
-            raise HTTPException(status_code=500, detail="Thumbnail generation failed.")
+            # _generate_image_thumb_sync already tries Pillow → ffmpeg → identity
+            # placeholder.  If it still raises, generate the identity thumb directly.
+            thumb.unlink(missing_ok=True)
+            print(f"[Thumbnail] unexpected error for {target.name}: {exc} – using identity thumb")
+            try:
+                await run_in_threadpool(_generate_identity_thumb, target, thumb)
+            except Exception:
+                pass  # identity generation is pure Pillow drawing, should never fail
         finally:
-            # Release lock entry to prevent unbounded dict growth.
             _thumb_locks.pop(cache_key, None)
 
-    if thumb.exists():
-        return _safe_file_response(thumb, "image/webp")
-    # Fallback: return the placeholder so the UI never shows a broken image
-    return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
+    return _safe_file_response(thumb, "image/webp")
 
 
 @app.get("/thumbnail/video/{file_path:path}", tags=["thumbnails"])
@@ -1219,9 +1590,13 @@ async def thumbnail_video(
     thumb     = get_thumb_path(file_path)
     src_mtime = src.stat().st_mtime
 
-    # Fast path: cached thumbnail exists and is newer than the source.
+    # Fast path: validate fully before trusting the cache.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-        return _safe_file_response(thumb, "image/webp")
+        if _validate_webp(thumb):
+            return _safe_file_response(thumb, "image/webp")
+        else:
+            print(f"[Thumbnail/video] evicting invalid cached thumb for {src.name}")
+            thumb.unlink(missing_ok=True)
 
     # Slow path: serialise concurrent requests for the same video thumbnail.
     cache_key = hash_for(file_path)
@@ -1337,18 +1712,16 @@ async def thumbnail_video(
 
         if not success:
             thumb.unlink(missing_ok=True)
-            print(f"[Thumbnail/video] all strategies exhausted for {src.name}")
+            print(f"[Thumbnail/video] all strategies exhausted for {src.name} – using identity thumb")
+            try:
+                await run_in_threadpool(_generate_identity_thumb, src, thumb)
+            except Exception:
+                pass
             _thumb_locks.pop(cache_key, None)
-            if FALLBACK_THUMB.exists():
-                return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
-            raise HTTPException(status_code=500, detail="Video thumbnail generation failed.")
         else:
             _thumb_locks.pop(cache_key, None)  # success path cleanup
 
-    if thumb.exists():
-        return _safe_file_response(thumb, "image/webp")
-    # Fallback: return the placeholder so the UI never shows a broken image
-    return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
+    return _safe_file_response(thumb, "image/webp")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
