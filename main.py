@@ -5,7 +5,7 @@ A self-hosted, offline-first media server for photos and videos.
 Designed for both web (web/index.html) and a future native Android client.
 
 Dependencies:
-    pip install fastapi uvicorn pillow aiofiles python-multipart
+    pip install fastapi uvicorn pillow aiofiles python-multipart zeroconf
 
 Optional:
     - ffmpeg on PATH  → enables video thumbnail generation
@@ -29,8 +29,11 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
+import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -56,6 +59,7 @@ from PIL import Image, ImageOps
 from PIL.ExifTags import TAGS
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+from zeroconf import ServiceInfo, Zeroconf
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -90,13 +94,136 @@ ALLOWED_VIDEO_MIMES = {"video/mp4", "video/quicktime", "video/x-matroska", "vide
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# mDNS / Auto-Discovery Config
+# ──────────────────────────────────────────────────────────────────────────────
+
+SERVER_PORT      = int(os.environ.get("PORT", 8000))
+SERVER_NAME      = os.environ.get("SERVER_NAME", "HomeDrive")
+SERVER_VERSION   = "2.0.0"
+MDNS_SERVICE_TYPE = "_http._tcp.local."
+SERVER_ID_FILE   = Path("server_id.txt")
+
+
+def _load_or_create_server_id() -> str:
+    """Return a stable UUID for this server instance, persisted to disk."""
+    if SERVER_ID_FILE.exists():
+        sid = SERVER_ID_FILE.read_text().strip()
+        if sid:
+            return sid
+    sid = str(uuid.uuid4())
+    SERVER_ID_FILE.write_text(sid)
+    return sid
+
+
+def _get_lan_ip() -> str:
+    """Return the primary LAN IP (not 127.x, not 0.0.0.0).
+
+    Technique: open a UDP socket toward a public address (no packet sent)
+    and read back which local interface the OS would use.  Works on Linux,
+    macOS, and Windows without requiring root or listing all interfaces.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        if not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    # Fallback: hostname resolution
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+SERVER_ID: str = _load_or_create_server_id()
+
+# Module-level zeroconf state (populated during startup, cleared on shutdown)
+_zeroconf: Optional[Zeroconf] = None
+_zc_service_info: Optional[ServiceInfo] = None
+
+
+def _register_mdns() -> None:
+    """Register the HomeDrive mDNS/Bonjour service on the LAN."""
+    global _zeroconf, _zc_service_info
+
+    lan_ip = _get_lan_ip()
+    service_name = f"{SERVER_NAME}.{MDNS_SERVICE_TYPE}"
+
+    _zc_service_info = ServiceInfo(
+        type_=MDNS_SERVICE_TYPE,
+        name=service_name,
+        addresses=[socket.inet_aton(lan_ip)],
+        port=SERVER_PORT,
+        properties={
+            b"name":       SERVER_NAME.encode(),
+            b"version":    SERVER_VERSION.encode(),
+            b"api":        b"v1",
+            b"server_id":  SERVER_ID.encode(),
+        },
+        server=f"{SERVER_NAME}.local.",
+    )
+
+    _zeroconf = Zeroconf()
+    _zeroconf.register_service(_zc_service_info)
+    print(f"[mDNS] Registered '{service_name}' → {lan_ip}:{SERVER_PORT}")
+
+
+def _unregister_mdns() -> None:
+    """Unregister the mDNS service so stale entries don't linger on the LAN."""
+    global _zeroconf, _zc_service_info
+    if _zeroconf and _zc_service_info:
+        try:
+            _zeroconf.unregister_service(_zc_service_info)
+            _zeroconf.close()
+            print("[mDNS] Service unregistered.")
+        except Exception as exc:
+            print(f"[mDNS] Unregister warning: {exc}")
+        finally:
+            _zeroconf = None
+            _zc_service_info = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # App
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Startup / Shutdown  (FastAPI lifespan)
+# ──────────────────────────────────────────────────────────────────────────────
+# NOTE: _rebuild_index, _search_index, and _register_mdns/_unregister_mdns are
+# all defined later in this module.  Python only executes function bodies at
+# call time, so forward references here are perfectly safe.
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # ── Startup ──────────────────────────────────────────────────────────────
+    _rebuild_index()
+    print(f"[Home Drive] Index built – {len(_search_index)} files indexed.")
+    if API_KEY:
+        print("[Home Drive] API key protection is ENABLED.")
+    else:
+        print("[Home Drive] API key protection is DISABLED (set MEDIA_API_KEY to enable).")
+
+    # mDNS registration runs in a thread (zeroconf does blocking I/O)
+    await run_in_threadpool(_register_mdns)
+
+    yield  # ← server is live and handling requests
+
+    # ── Shutdown ─────────────────────────────────────────────────────────────
+    await run_in_threadpool(_unregister_mdns)
+    print("[Home Drive] Shutdown complete.")
+
 
 app = FastAPI(
     title="Home Drive",
     description="Personal LAN media server – photos & videos, no cloud.",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -115,6 +242,23 @@ app.add_middleware(
 _WEB_DIR = Path("web")
 if _WEB_DIR.exists():
     app.mount("/web", StaticFiles(directory=str(_WEB_DIR), html=True), name="web")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Health / Discovery endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["discovery"])
+def health_check():
+    """Lightweight endpoint used by Android after mDNS resolution to confirm
+    it has found a genuine HomeDrive server (not just any HTTP service)."""
+    return {
+        "status":     "ok",
+        "name":       SERVER_NAME,
+        "version":    SERVER_VERSION,
+        "server_id":  SERVER_ID,
+        "lan_ip":     _get_lan_ip(),
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -550,9 +694,8 @@ def home():
     }
 
 
-@app.get("/health", tags=["meta"])
-def health():
-    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
+# NOTE: /health is defined earlier in the "discovery" section and returns full
+#       server identity info used by the Android auto-discovery flow.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1067,18 +1210,3 @@ def not_found(_req, _exc):
 @app.exception_handler(500)
 def server_error(_req, exc):
     return JSONResponse(status_code=500, content={"error": "server error", "detail": str(exc)})
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Startup
-# ──────────────────────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-def on_startup():
-    """Pre-build the search index on startup so the first search is instant."""
-    _rebuild_index()
-    print(f"[Home Drive] Index built – {len(_search_index)} files indexed.")
-    if API_KEY:
-        print("[Home Drive] API key protection is ENABLED.")
-    else:
-        print("[Home Drive] API key protection is DISABLED (set MEDIA_API_KEY to enable).")
