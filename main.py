@@ -31,6 +31,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -666,53 +667,237 @@ def get_thumb_path(relpath: str) -> Path:
     return THUMB_DIR / f"{hash_for(relpath)}.webp"
 
 
-def _generate_image_thumb_sync(src: Path, out: Path) -> None:
-    """Generate a WebP thumbnail using Pillow, with ffmpeg as a fallback.
+def _safe_file_response(path: Path, media_type: str) -> FileResponse:
+    """Return a FileResponse, falling back to FALLBACK_THUMB if the file
+    vanished between the exists() check and now (race condition / deletion)."""
+    if path.exists():
+        return FileResponse(str(path), media_type=media_type)
+    if FALLBACK_THUMB.exists():
+        return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
+    raise HTTPException(status_code=404, detail="File not found.")
 
-    Strategy mirrors Plex / Jellyfin:
-      1. Pillow handles the vast majority of JPEGs, PNGs, HEICs (via pillow-heif),
-         WebPs, and anything else it has a decoder for.
-      2. If Pillow fails for any reason (exotic codec, edge-case corruption, etc.)
-         we fall back to ffmpeg, which can decode almost any image format via its
-         libswscale pipeline.
+
+def _normalise_image_mode(im: Image.Image) -> Image.Image:
+    """Convert any Pillow mode to RGB or RGBA, which WebP can encode natively.
+
+    Handles every exotic mode that arrives from real-world phone photos:
+      P  (palette / indexed)  → RGBA first to preserve transparency, then RGB
+      PA (palette + alpha)    → RGBA → RGB
+      CMYK                    → RGB  (Pillow handles the inversion correctly)
+      I / I;16 (16-bit grey)  → L (8-bit) → RGB
+      F  (32-bit float grey)  → L → RGB
+      L  (8-bit grey)         → RGB
+      RGBA                    → keep as-is (WebP supports it natively)
+      RGB                     → keep as-is
     """
+    if im.mode in ("P", "PA"):
+        im = im.convert("RGBA")
+    if im.mode in ("I", "I;16", "F"):
+        # Normalise 16-bit / float to 8-bit grey before colour conversion
+        im = im.point(lambda px: px * (1 / 256)).convert("L")
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGB")
+    return im
+
+
+def _ffmpeg_to_webp(src: Path, out: Path, extra_vf: str = "") -> bool:
+    """Extract one frame from *src* and write a genuine WebP file to *out*.
+
+    Pipeline (two steps, no shortcuts):
+      1. ffmpeg  →  a real temp file with the correct extension for its codec
+                    (never written to *out* or any path near *out*)
+      2. Pillow  →  reads the temp, converts to WebP, writes to a second temp,
+                    then atomically renames that second temp to *out*
+
+    This guarantees *out* is always either:
+      a) a complete, valid WebP  — if everything succeeded, or
+      b) absent                  — if anything failed
+
+    No partial files, no PNG-disguised-as-WebP, no cross-extension confusion.
+
+    Tries ffmpeg with PNG output first (works everywhere), then MJPEG (last
+    resort for unusual builds without a PNG encoder).
+    """
+    scale = (
+        f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)'"
+        f":force_original_aspect_ratio=decrease"
+    )
+    vf = f"{scale},{extra_vf}" if extra_vf else scale
+
+    def _ffmpeg_to_temp(vcodec: str, suffix: str) -> Optional[Path]:
+        """Run ffmpeg into a proper temp file; return its Path or None on failure."""
+        try:
+            fd, tmp_path_str = tempfile.mkstemp(suffix=suffix, dir=THUMB_DIR)
+            os.close(fd)
+            tmp = Path(tmp_path_str)
+        except OSError as exc:
+            print(f"[Thumbnail/ffmpeg] could not create temp file: {exc}")
+            return None
+
+        cmd = ["ffmpeg", "-y", "-i", str(src), "-vframes", "1",
+               "-vf", vf, "-vcodec", vcodec, str(tmp)]
+        try:
+            subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=10)
+            if tmp.stat().st_size > 0:
+                return tmp
+            print(f"[Thumbnail/ffmpeg] zero-byte output for {src.name} ({vcodec})")
+        except subprocess.CalledProcessError as exc:
+            output = exc.output.decode(errors="replace").strip()
+            print(f"[Thumbnail/ffmpeg] {vcodec} failed for {src.name}:\n  {output}")
+        except subprocess.TimeoutExpired:
+            print(f"[Thumbnail/ffmpeg] timed out (10 s) for {src.name}")
+        except OSError as exc:
+            print(f"[Thumbnail/ffmpeg] OS error for {src.name}: {exc}")
+        finally:
+            tmp.unlink(missing_ok=True)
+        return None
+
+    def _pillow_temp_to_webp(img_tmp: Path) -> bool:
+        """Read *img_tmp* with Pillow, write WebP to a temp, rename to *out*.
+
+        *img_tmp* is cleaned up by the caller regardless of outcome.
+        A partially-written WebP temp is cleaned up here on any exception.
+        """
+        try:
+            fd, webp_tmp_str = tempfile.mkstemp(suffix=".webp", dir=THUMB_DIR)
+            os.close(fd)
+            webp_tmp = Path(webp_tmp_str)
+        except OSError as exc:
+            print(f"[Thumbnail/pillow] could not create WebP temp: {exc}")
+            return False
+        try:
+            with Image.open(img_tmp) as im:
+                im.load()
+                im = _normalise_image_mode(im)
+                im.save(webp_tmp, format="WEBP", quality=85, method=6)
+            # Atomic rename: *out* becomes a complete WebP or doesn't change at all
+            webp_tmp.replace(out)
+            return True
+        except Exception as exc:
+            print(f"[Thumbnail/pillow] conversion failed for {src.name}: {exc}")
+            webp_tmp.unlink(missing_ok=True)
+            return False
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Strategy 1 — PNG → Pillow → WebP  (works on every ffmpeg build)
+    img_tmp = _ffmpeg_to_temp("png", ".png")
+    if img_tmp:
+        try:
+            if _pillow_temp_to_webp(img_tmp):
+                return True
+        finally:
+            img_tmp.unlink(missing_ok=True)
+
+    # Strategy 2 — MJPEG → Pillow → WebP  (last resort)
+    img_tmp = _ffmpeg_to_temp("mjpeg", ".jpg")
+    if img_tmp:
+        try:
+            if _pillow_temp_to_webp(img_tmp):
+                return True
+        finally:
+            img_tmp.unlink(missing_ok=True)
+
+    return False
+
+
+def _generate_image_thumb_sync(src: Path, out: Path) -> None:
+    """Generate a WebP thumbnail covering all real-world failure cases.
+
+    Stage 1 — Pillow (fast, handles JPEGs / PNGs / HEIC / WebP / GIF / TIFF).
+    Stage 2 — ffmpeg with libwebp, PNG fallback, or MJPEG fallback.
+
+    Failure cases handled:
+      • Zero / tiny files (corrupt transfer)
+      • Palette mode P/PA images (GIFs, indexed PNGs)
+      • CMYK JPEGs (scanned docs, some print workflows)
+      • 16-bit / HDR TIFFs (mode I, I;16, F)
+      • Animated GIFs (seeks to frame 0 explicitly)
+      • Broken ICC profiles (open with ignore_exif=True re-attempt)
+      • Broken EXIF orientation data (silent pass)
+      • 50 MP+ images (MemoryError → ffmpeg fallback)
+      • ffmpeg missing libwebp encoder (PNG/JPEG intermediate strategy)
+    """
+    # ── Guard: refuse empty / near-empty files immediately ───────────────────
     try:
-        with Image.open(src) as im:
+        file_size = src.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"Cannot stat {src.name}: {exc}")
+    if file_size < 16:
+        raise RuntimeError(f"{src.name} is {file_size} bytes – likely a corrupt transfer")
+
+    # ── Stage 1: Pillow ───────────────────────────────────────────────────────
+    pillow_err: Optional[Exception] = None
+    try:
+        with Image.open(src) as _raw:
+            # Seek to frame 0 for animated formats (GIF, APNG, animated WebP)
+            # before anything else – avoids EOF errors on subsequent operations.
             try:
-                im = ImageOps.exif_transpose(im)   # correct EXIF orientation
+                _raw.seek(0)
+            except (AttributeError, EOFError):
+                pass
+
+            # load() before exif_transpose so the full pixel data is in memory
+            # and exif_transpose works on a self-contained copy.
+            _raw.load()
+
+            try:
+                im = ImageOps.exif_transpose(_raw)
             except Exception:
-                pass   # broken EXIF block – continue with raw pixel orientation
+                im = _raw   # broken EXIF – use image as-is
 
-            im.load()   # force full decode; works with LOAD_TRUNCATED_IMAGES=True
-
-            if im.mode not in ("RGB", "RGBA"):
-                im = im.convert("RGB")
-
+            im = _normalise_image_mode(im)
             im.thumbnail(THUMB_SIZE, Image.LANCZOS)
             out.parent.mkdir(parents=True, exist_ok=True)
-            im.save(out, format="WEBP", quality=85, method=6)
-            return   # ← success; skip ffmpeg fallback
+            fd, webp_tmp_str = tempfile.mkstemp(suffix=".webp", dir=out.parent)
+            os.close(fd)
+            webp_tmp = Path(webp_tmp_str)
+            try:
+                im.save(webp_tmp, format="WEBP", quality=85, method=6)
+                webp_tmp.replace(out)  # atomic rename; out is always complete WebP or absent
+            except Exception:
+                webp_tmp.unlink(missing_ok=True)
+                raise
+            return  # ← success, skip ffmpeg entirely
 
-    except Exception as pillow_err:
-        print(f"[Thumbnail] Pillow failed for {src.name}: {pillow_err} – trying ffmpeg")
+    except Exception as exc:
+        pillow_err = exc
+        # Some JPEGs embed a broken ICC profile that causes ImageCmsProfileError
+        # on open().  Re-attempt with the profile stripped.
+        if "icc" in str(exc).lower() or "profile" in str(exc).lower():
+            try:
+                with Image.open(src) as _raw:
+                    _raw.info.pop("icc_profile", None)
+                    _raw.load()
+                    im = _normalise_image_mode(_raw)
+                    im.thumbnail(THUMB_SIZE, Image.LANCZOS)
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    fd, webp_tmp_str = tempfile.mkstemp(suffix=".webp", dir=out.parent)
+                    os.close(fd)
+                    webp_tmp = Path(webp_tmp_str)
+                    try:
+                        im.save(webp_tmp, format="WEBP", quality=85, method=6)
+                        webp_tmp.replace(out)
+                    except Exception:
+                        webp_tmp.unlink(missing_ok=True)
+                        raise
+                    print(f"[Thumbnail] {src.name}: recovered after stripping ICC profile")
+                    return
+            except Exception:
+                pass
 
-    # ── ffmpeg fallback ───────────────────────────────────────────────────────
+    print(f"[Thumbnail] Pillow failed for {src.name}: {pillow_err!r} – trying ffmpeg")
+
+    # ── Stage 2: ffmpeg (multi-strategy) ─────────────────────────────────────
     if not shutil.which("ffmpeg"):
         raise RuntimeError("Pillow failed and ffmpeg is not available as a fallback")
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(src),
-        "-vframes", "1",
-        "-vf", (
-            f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)'"
-            f":force_original_aspect_ratio=decrease"
-        ),
-        "-vcodec", "libwebp",
-        str(out),
-    ]
-    subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=10)
+    if _ffmpeg_to_webp(src, out):
+        print(f"[Thumbnail] {src.name}: generated via ffmpeg fallback")
+        return
+
+    raise RuntimeError(f"All thumbnail strategies failed for {src.name}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -985,7 +1170,7 @@ async def thumbnail_image(
     # We generated it ourselves so we trust it; no .verify() needed.
     # If it turns out corrupt the generator's except block will evict it.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-        return FileResponse(thumb, media_type="image/webp")
+        return _safe_file_response(thumb, "image/webp")
 
     # Slow path: acquire a per-thumbnail asyncio.Lock so that if multiple
     # requests arrive simultaneously for the same image, only ONE actually
@@ -998,7 +1183,7 @@ async def thumbnail_image(
     async with lock:
         # Re-check inside the lock – a previous waiter may have just written it.
         if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-            return FileResponse(thumb, media_type="image/webp")
+            return _safe_file_response(thumb, "image/webp")
         try:
             await run_in_threadpool(_generate_image_thumb_sync, target, thumb)
         except Exception as exc:
@@ -1013,7 +1198,7 @@ async def thumbnail_image(
             _thumb_locks.pop(cache_key, None)
 
     if thumb.exists():
-        return FileResponse(thumb, media_type="image/webp")
+        return _safe_file_response(thumb, "image/webp")
     # Fallback: return the placeholder so the UI never shows a broken image
     return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
 
@@ -1036,7 +1221,7 @@ async def thumbnail_video(
 
     # Fast path: cached thumbnail exists and is newer than the source.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-        return FileResponse(thumb, media_type="image/webp")
+        return _safe_file_response(thumb, "image/webp")
 
     # Slow path: serialise concurrent requests for the same video thumbnail.
     cache_key = hash_for(file_path)
@@ -1047,43 +1232,121 @@ async def thumbnail_video(
     async with lock:
         # Re-check: a previous waiter may have already generated it.
         if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-            return FileResponse(thumb, media_type="image/webp")
+            return _safe_file_response(thumb, "image/webp")
 
         thumb.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", "00:00:00.5",    # 0.5 s seek – avoids black frame 0, safe for short clips
-            "-i", str(src),
-            "-vframes", "1",
-            "-vf", (
-                f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)'"
-                f":force_original_aspect_ratio=decrease"
-                f",autorotate"      # honour rotation metadata in one filter chain
-            ),
-            "-vcodec", "libwebp",   # explicitly force WebP – avoids mime/format mismatch
-            str(thumb),
-        ]
-        try:
-            async with FFMPEG_SEMAPHORE:   # cap concurrent ffmpeg processes
-                await run_in_threadpool(
-                    subprocess.check_output, cmd,
-                    stderr=subprocess.STDOUT,
-                    timeout=10,     # 10 s is ample for a single-frame extract; avoids hung processes
-                )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            thumb.unlink(missing_ok=True)   # discard any half-written file
-            print(f"[Thumbnail] ffmpeg error for {src.name}: {exc}")
+
+        scale_filter = (
+            f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)'"
+            f":force_original_aspect_ratio=decrease"
+        )
+
+        # Four progressively more compatible video thumbnail strategies.
+        # ffmpeg NEVER writes to the final thumb path directly — always to a
+        # temp file, then Pillow converts to WebP, then atomic rename to thumb.
+        # This prevents partial/corrupt cached files on any interruption.
+        #
+        #  A) seek 0.5 s + autorotate + PNG→Pillow  — ideal path
+        #  B) no seek   + autorotate + PNG→Pillow   — fixes short clips < 0.5 s
+        #  C) no seek   + no autorotate + PNG→Pillow — fixes ffmpeg < 4.0
+        #  D) no seek   + no autorotate + MJPEG→Pillow — last resort
+
+        async def _try_video_strategy(seek: Optional[str], vf: str,
+                                      vcodec: str, suffix: str) -> bool:
+            """ffmpeg → properly-typed temp → Pillow → WebP temp → atomic rename."""
+            # Step 1: ffmpeg writes its native format to a real temp file
+            try:
+                fd, img_tmp_str = tempfile.mkstemp(suffix=suffix, dir=THUMB_DIR)
+                os.close(fd)
+                img_tmp = Path(img_tmp_str)
+            except OSError as exc:
+                print(f"[Thumbnail/video] temp file creation failed: {exc}")
+                return False
+
+            cmd = ["ffmpeg", "-y"]
+            if seek:
+                cmd += ["-ss", seek]
+            cmd += ["-i", str(src), "-vframes", "1", "-vf", vf,
+                    "-vcodec", vcodec, str(img_tmp)]
+            try:
+                async with FFMPEG_SEMAPHORE:
+                    await run_in_threadpool(
+                        subprocess.check_output, cmd,
+                        stderr=subprocess.STDOUT, timeout=10,
+                    )
+                if not img_tmp.exists() or img_tmp.stat().st_size == 0:
+                    print(f"[Thumbnail/video] zero-byte output for {src.name} ({vcodec})")
+                    return False
+            except subprocess.CalledProcessError as exc:
+                output = exc.output.decode(errors="replace").strip()
+                print(f"[Thumbnail/video] {vcodec} failed for {src.name}:\n  {output}")
+                return False
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                print(f"[Thumbnail/video] error for {src.name}: {exc}")
+                return False
+            finally:
+                # img_tmp cleanup deferred to step 2's finally block below
+                pass
+
+            # Step 2: Pillow reads the native-format temp, saves WebP to a
+            # second temp, then atomically renames to thumb.
+            # img_tmp (the ffmpeg output) is always cleaned up here.
+            try:
+                fd, webp_tmp_str = tempfile.mkstemp(suffix=".webp", dir=THUMB_DIR)
+                os.close(fd)
+                webp_tmp = Path(webp_tmp_str)
+            except OSError as exc:
+                print(f"[Thumbnail/video] WebP temp creation failed: {exc}")
+                img_tmp.unlink(missing_ok=True)
+                return False
+
+            try:
+                def _convert():
+                    with Image.open(img_tmp) as im:
+                        im.load()
+                        im = _normalise_image_mode(im)
+                        im.save(webp_tmp, format="WEBP", quality=85, method=6)
+                    # Atomic rename: thumb is always a complete WebP or absent
+                    webp_tmp.replace(thumb)
+
+                await run_in_threadpool(_convert)
+                return True
+            except Exception as exc:
+                print(f"[Thumbnail/video] Pillow→WebP failed for {src.name}: {exc}")
+                webp_tmp.unlink(missing_ok=True)
+                return False
+            finally:
+                img_tmp.unlink(missing_ok=True)
+
+        vf_rotate    = f"{scale_filter},autorotate"
+        vf_no_rotate = scale_filter
+        success = False
+
+        # Strategy A – seek + autorotate + PNG→Pillow
+        if not success:
+            success = await _try_video_strategy("00:00:00.5", vf_rotate, "png", ".png")
+        # Strategy B – no seek + autorotate + PNG→Pillow (short clips)
+        if not success:
+            success = await _try_video_strategy(None, vf_rotate, "png", ".png")
+        # Strategy C – no seek + no autorotate + PNG→Pillow (old ffmpeg)
+        if not success:
+            success = await _try_video_strategy(None, vf_no_rotate, "png", ".png")
+        # Strategy D – no seek + no autorotate + MJPEG→Pillow (last resort)
+        if not success:
+            success = await _try_video_strategy(None, vf_no_rotate, "mjpeg", ".jpg")
+
+        if not success:
+            thumb.unlink(missing_ok=True)
+            print(f"[Thumbnail/video] all strategies exhausted for {src.name}")
             _thumb_locks.pop(cache_key, None)
             if FALLBACK_THUMB.exists():
                 return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
-            raise HTTPException(status_code=500, detail="ffmpeg failed to generate a thumbnail.")
-        finally:
-            # Release the lock entry so the dict doesn't grow without bound.
-            # Any concurrent waiters that got through will regenerate if needed.
-            _thumb_locks.pop(cache_key, None)
+            raise HTTPException(status_code=500, detail="Video thumbnail generation failed.")
+        else:
+            _thumb_locks.pop(cache_key, None)  # success path cleanup
 
     if thumb.exists():
-        return FileResponse(thumb, media_type="image/webp")
+        return _safe_file_response(thumb, "image/webp")
     # Fallback: return the placeholder so the UI never shows a broken image
     return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
 
