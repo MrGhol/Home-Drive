@@ -306,6 +306,12 @@ def health_check():
 # never block each other.
 _thumb_locks: Dict[str, asyncio.Lock] = {}
 
+# Global ffmpeg concurrency limit.
+# Caps simultaneous video-thumbnail processes so a burst of requests can't
+# saturate CPU on weak hardware.  Value of 2 is conservative and safe for
+# any LAN server; raise it if your machine has spare cores to spare.
+FFMPEG_SEMAPHORE = asyncio.Semaphore(2)
+
 # Rate limiter: { ip: [timestamp, ...] }
 _ip_counters: Dict[str, List[float]] = {}
 
@@ -1038,11 +1044,12 @@ async def thumbnail_video(
             str(thumb),
         ]
         try:
-            await run_in_threadpool(
-                subprocess.check_output, cmd,
-                stderr=subprocess.STDOUT,
-                timeout=30,
-            )
+            async with FFMPEG_SEMAPHORE:   # cap concurrent ffmpeg processes
+                await run_in_threadpool(
+                    subprocess.check_output, cmd,
+                    stderr=subprocess.STDOUT,
+                    timeout=10,     # 10 s is ample for a single-frame extract; avoids hung processes
+                )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             thumb.unlink(missing_ok=True)   # discard any half-written file
             print(f"[Thumbnail] ffmpeg error for {src.name}: {exc}")
