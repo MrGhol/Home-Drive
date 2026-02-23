@@ -5,7 +5,7 @@ A self-hosted, offline-first media server for photos and videos.
 Designed for both web (web/index.html) and a future native Android client.
 
 Dependencies:
-    pip install fastapi uvicorn pillow aiofiles python-multipart zeroconf
+    pip install fastapi uvicorn pillow aiofiles python-multipart zeroconf pillow-heif
 
 Optional:
     - ffmpeg on PATH  → enables video thumbnail generation
@@ -61,6 +61,14 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from zeroconf import ServiceInfo, Zeroconf
 
+# HEIC/HEIF support – must be registered before any Image.open() call.
+# Install with:  pip install pillow-heif
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass   # HEIC uploads will still be accepted; thumbnails will gracefully fail
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
@@ -85,8 +93,33 @@ MAX_PHOTO_BYTES = 200 * 1024 * 1024   # 200 MB
 MAX_VIDEO_BYTES = 500 * 1024 * 1024   # 500 MB
 
 # Thumbnails
-THUMB_SIZE  = (320, 320)
-CHUNK_SIZE  = 1024 * 1024   # 1 MiB streaming chunks
+THUMB_SIZE     = (320, 320)
+CHUNK_SIZE     = 1024 * 1024   # 1 MiB streaming chunks
+FALLBACK_THUMB = THUMB_DIR / "fallback.webp"
+
+
+def _ensure_fallback_thumb() -> None:
+    """Create a neutral grey placeholder thumbnail if one doesn't exist yet.
+
+    Called once on startup.  The placeholder is a 320×320 grey WebP with a
+    centered film-strip icon drawn in pure Pillow – no external assets needed.
+    """
+    if FALLBACK_THUMB.exists():
+        return
+    try:
+        from PIL import ImageDraw, ImageFont
+        size = THUMB_SIZE[0]
+        img  = Image.new("RGB", (size, size), color=(45, 45, 48))   # dark-grey bg
+        draw = ImageDraw.Draw(img)
+        # Draw a simple camera-shutter / image icon using basic shapes
+        cx, cy, r = size // 2, size // 2, size // 5
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(120, 120, 130), width=6)
+        draw.line([cx - r - 20, cy, cx + r + 20, cy], fill=(120, 120, 130), width=3)
+        draw.line([cx, cy - r - 20, cx, cy + r + 20], fill=(120, 120, 130), width=3)
+        FALLBACK_THUMB.parent.mkdir(parents=True, exist_ok=True)
+        img.save(FALLBACK_THUMB, format="WEBP", quality=80)
+    except Exception:
+        pass   # if even this fails, endpoint will 404 gracefully
 
 # Allowed MIME prefixes (checked server-side via Pillow / ffprobe)
 ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"}
@@ -203,6 +236,7 @@ def _unregister_mdns() -> None:
 async def lifespan(_app: FastAPI):
     # ── Startup ──────────────────────────────────────────────────────────────
     _rebuild_index()
+    _ensure_fallback_thumb()
     print(f"[Home Drive] Index built – {len(_search_index)} files indexed.")
     if API_KEY:
         print("[Home Drive] API key protection is ENABLED.")
@@ -895,15 +929,27 @@ async def thumbnail_image(
     target = ensure_in_base(file_path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
-    if not mime_type_for(target).startswith("image/"):
+
+    # Validate that the file is actually a readable image (not just extension).
+    # This also catches HEIC/HEIF and any format Pillow+plugins can open.
+    try:
+        with Image.open(target) as _probe:
+            _probe.verify()
+    except Exception:
         raise HTTPException(status_code=400, detail="Thumbnails are only generated for images.")
 
     thumb     = get_thumb_path(file_path)
     src_mtime = target.stat().st_mtime
 
-    # Fast path: valid cached thumbnail already on disk – no lock needed.
+    # Fast path: cached thumbnail exists – but validate it first to auto-heal
+    # any previously half-written / corrupt cached file.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-        return FileResponse(thumb, media_type="image/webp")
+        try:
+            with Image.open(thumb) as _t:
+                _t.verify()
+            return FileResponse(thumb, media_type="image/webp")
+        except Exception:
+            thumb.unlink(missing_ok=True)   # evict corrupt cache entry and regenerate
 
     # Slow path: acquire a per-thumbnail asyncio.Lock so that if multiple
     # requests arrive simultaneously for the same image, only ONE actually
@@ -919,10 +965,14 @@ async def thumbnail_image(
             return FileResponse(thumb, media_type="image/webp")
         try:
             await run_in_threadpool(_generate_image_thumb_sync, target, thumb)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Thumbnail generation failed: {exc}")
+        except Exception:
+            thumb.unlink(missing_ok=True)   # discard any half-written file
+            raise HTTPException(status_code=500, detail="Thumbnail generation failed.")
 
-    return FileResponse(thumb, media_type="image/webp")
+    if thumb.exists():
+        return FileResponse(thumb, media_type="image/webp")
+    # Fallback: return the placeholder so the UI never shows a broken image
+    return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
 
 
 @app.get("/thumbnail/video/{file_path:path}", tags=["thumbnails"])
@@ -941,9 +991,14 @@ async def thumbnail_video(
     thumb     = get_thumb_path(file_path)
     src_mtime = src.stat().st_mtime
 
-    # Fast path: valid cached thumbnail already on disk.
+    # Fast path: cached thumbnail exists – validate to auto-heal corrupt files.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-        return FileResponse(thumb, media_type="image/webp")
+        try:
+            with Image.open(thumb) as _t:
+                _t.verify()
+            return FileResponse(thumb, media_type="image/webp")
+        except Exception:
+            thumb.unlink(missing_ok=True)   # evict corrupt cache entry and regenerate
 
     # Slow path: serialise concurrent requests for the same video thumbnail.
     cache_key = hash_for(file_path)
@@ -958,11 +1013,15 @@ async def thumbnail_video(
 
         thumb.parent.mkdir(parents=True, exist_ok=True)
         cmd = [
-            "ffmpeg", "-y", "-i", str(src),
+            "ffmpeg", "-y",
+            "-ss", "00:00:01",          # seek 1 s in – frame 0 is often black
+            "-i", str(src),
             "-vframes", "1",
-            "-vf", f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)':force_original_aspect_ratio=decrease",
-            # Auto-rotate using video stream metadata (equiv of EXIF-transpose for images)
-            "-vf", "transpose=0",
+            "-vf", (
+                f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)'"
+                f":force_original_aspect_ratio=decrease"
+                f",autorotate"           # honour rotation metadata in one filter chain
+            ),
             "-f", "image2", str(thumb),
         ]
         try:
@@ -972,9 +1031,13 @@ async def thumbnail_video(
                 timeout=30,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            thumb.unlink(missing_ok=True)   # discard any half-written file
             raise HTTPException(status_code=500, detail="ffmpeg failed to generate a thumbnail.")
 
-    return FileResponse(thumb, media_type="image/webp")
+    if thumb.exists():
+        return FileResponse(thumb, media_type="image/webp")
+    # Fallback: return the placeholder so the UI never shows a broken image
+    return FileResponse(str(FALLBACK_THUMB), media_type="image/webp")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
