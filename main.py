@@ -667,25 +667,52 @@ def get_thumb_path(relpath: str) -> Path:
 
 
 def _generate_image_thumb_sync(src: Path, out: Path) -> None:
-    with Image.open(src) as im:
-        # Correct EXIF orientation before anything else.
-        # Wrapped so a broken/missing EXIF block never kills the thumbnail.
-        try:
-            im = ImageOps.exif_transpose(im)
-        except Exception:
-            pass  # silently continue with raw pixel orientation
+    """Generate a WebP thumbnail using Pillow, with ffmpeg as a fallback.
 
-        # Force full decode – catches truncated files that LOAD_TRUNCATED_IMAGES
-        # lets through; we want the pixels, not an exception.
-        im.load()
+    Strategy mirrors Plex / Jellyfin:
+      1. Pillow handles the vast majority of JPEGs, PNGs, HEICs (via pillow-heif),
+         WebPs, and anything else it has a decoder for.
+      2. If Pillow fails for any reason (exotic codec, edge-case corruption, etc.)
+         we fall back to ffmpeg, which can decode almost any image format via its
+         libswscale pipeline.
+    """
+    try:
+        with Image.open(src) as im:
+            try:
+                im = ImageOps.exif_transpose(im)   # correct EXIF orientation
+            except Exception:
+                pass   # broken EXIF block – continue with raw pixel orientation
 
-        # WebP supports RGB and RGBA natively; convert anything else (P, L, CMYK…)
-        if im.mode not in ("RGB", "RGBA"):
-            im = im.convert("RGB")
+            im.load()   # force full decode; works with LOAD_TRUNCATED_IMAGES=True
 
-        im.thumbnail(THUMB_SIZE, Image.LANCZOS)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        im.save(out, format="WEBP", quality=85, method=6)
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGB")
+
+            im.thumbnail(THUMB_SIZE, Image.LANCZOS)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            im.save(out, format="WEBP", quality=85, method=6)
+            return   # ← success; skip ffmpeg fallback
+
+    except Exception as pillow_err:
+        print(f"[Thumbnail] Pillow failed for {src.name}: {pillow_err} – trying ffmpeg")
+
+    # ── ffmpeg fallback ───────────────────────────────────────────────────────
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("Pillow failed and ffmpeg is not available as a fallback")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(src),
+        "-vframes", "1",
+        "-vf", (
+            f"scale='min({THUMB_SIZE[0]},iw)':'min({THUMB_SIZE[1]},ih)'"
+            f":force_original_aspect_ratio=decrease"
+        ),
+        "-vcodec", "libwebp",
+        str(out),
+    ]
+    subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=10)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
