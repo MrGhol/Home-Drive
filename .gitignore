@@ -10,11 +10,11 @@ venv/
 .venv/
 
 # Media folders
-photos/
-videos/
+media/
 
 # Metadata cache
 .metadata.json
+server_id.txt
 
 # OS files
 .DS_Store
