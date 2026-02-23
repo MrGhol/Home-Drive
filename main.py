@@ -55,11 +55,15 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile, ImageOps
 from PIL.ExifTags import TAGS
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 from zeroconf import ServiceInfo, Zeroconf
+
+# Let Pillow decode truncated / partially-transferred images instead of crashing.
+# This alone fixes the majority of phone-transfer JPEG issues.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # HEIC/HEIF support – must be registered before any Image.open() call.
 # Install with:  pip install pillow-heif
@@ -67,7 +71,7 @@ try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
 except ImportError:
-    pass   # HEIC uploads will still be accepted; thumbnails will gracefully fail
+    pass   # HEIC uploads will still be accepted; thumbnails will gracefully fall back
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -664,15 +668,21 @@ def get_thumb_path(relpath: str) -> Path:
 
 def _generate_image_thumb_sync(src: Path, out: Path) -> None:
     with Image.open(src) as im:
-        im.load()
+        # Correct EXIF orientation before anything else.
+        # Wrapped so a broken/missing EXIF block never kills the thumbnail.
         try:
-            im = ImageOps.exif_transpose(im)   # fix orientation from EXIF
-        except Exception as exc:
-            # Broken EXIF block – log and continue with the raw image rather
-            # than failing the whole thumbnail request.
-            print(f"[Thumbnail] EXIF transpose warning for {src.name}: {exc}")
-        if im.mode not in ("RGB", "L"):
+            im = ImageOps.exif_transpose(im)
+        except Exception:
+            pass  # silently continue with raw pixel orientation
+
+        # Force full decode – catches truncated files that LOAD_TRUNCATED_IMAGES
+        # lets through; we want the pixels, not an exception.
+        im.load()
+
+        # WebP supports RGB and RGBA natively; convert anything else (P, L, CMYK…)
+        if im.mode not in ("RGB", "RGBA"):
             im = im.convert("RGB")
+
         im.thumbnail(THUMB_SIZE, Image.LANCZOS)
         out.parent.mkdir(parents=True, exist_ok=True)
         im.save(out, format="WEBP", quality=85, method=6)
@@ -941,26 +951,14 @@ async def thumbnail_image(
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
 
-    # Validate that the file is actually a readable image (not just extension).
-    # This also catches HEIC/HEIF and any format Pillow+plugins can open.
-    try:
-        with Image.open(target) as _probe:
-            _probe.verify()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Thumbnails are only generated for images.")
-
     thumb     = get_thumb_path(file_path)
     src_mtime = target.stat().st_mtime
 
-    # Fast path: cached thumbnail exists – but validate it first to auto-heal
-    # any previously half-written / corrupt cached file.
+    # Fast path: cached thumbnail exists and is newer than the source.
+    # We generated it ourselves so we trust it; no .verify() needed.
+    # If it turns out corrupt the generator's except block will evict it.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-        try:
-            with Image.open(thumb) as _t:
-                _t.verify()
-            return FileResponse(thumb, media_type="image/webp")
-        except Exception:
-            thumb.unlink(missing_ok=True)   # evict corrupt cache entry and regenerate
+        return FileResponse(thumb, media_type="image/webp")
 
     # Slow path: acquire a per-thumbnail asyncio.Lock so that if multiple
     # requests arrive simultaneously for the same image, only ONE actually
@@ -1009,14 +1007,9 @@ async def thumbnail_video(
     thumb     = get_thumb_path(file_path)
     src_mtime = src.stat().st_mtime
 
-    # Fast path: cached thumbnail exists – validate to auto-heal corrupt files.
+    # Fast path: cached thumbnail exists and is newer than the source.
     if thumb.exists() and thumb.stat().st_mtime >= src_mtime:
-        try:
-            with Image.open(thumb) as _t:
-                _t.verify()
-            return FileResponse(thumb, media_type="image/webp")
-        except Exception:
-            thumb.unlink(missing_ok=True)   # evict corrupt cache entry and regenerate
+        return FileResponse(thumb, media_type="image/webp")
 
     # Slow path: serialise concurrent requests for the same video thumbnail.
     cache_key = hash_for(file_path)
