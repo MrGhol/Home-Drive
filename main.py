@@ -1217,6 +1217,83 @@ def delete_folder(folder_name: str, _auth=Depends(require_api_key)):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Routes – hierarchical browser
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/folders/browse", tags=["folders"])
+def browse(path: str = "", request: Request = None, _auth=Depends(require_api_key)):
+    """
+    Hierarchical browser: returns both subfolders and files for a given relative path.
+    Path is relative to the project BASE_DIR (e.g. "photos/2026").
+
+    Uses fully resolved absolute paths throughout to avoid ValueError when
+    BASE_DIR is a relative Path and items resolve to absolute paths.
+    """
+    try:
+        rate_limit(request)
+
+        # Resolve both to absolute paths so relative_to() comparisons never fail
+        base_abs = BASE_DIR.resolve()
+        target   = safe_join(BASE_DIR, path).resolve()
+
+        if not target.exists() or not target.is_dir():
+            return {"folders": [], "files": []}
+
+        folders = []
+        files   = []
+
+        for item in sorted(target.iterdir()):
+            if item.name.startswith("."):
+                continue
+
+            # Resolve item before calling relative_to to prevent ValueError
+            try:
+                item_abs = item.resolve()
+                rel      = str(item_abs.relative_to(base_abs)).replace("\\", "/")
+            except ValueError:
+                continue  # Skip anything that somehow falls outside BASE_DIR
+
+            if item.is_dir():
+                try:
+                    inner = list(item.iterdir())
+                    count = len([f for f in inner if f.is_file() and not f.name.startswith(".")])
+
+                    preview = None
+                    imgs = sorted(
+                        [f for f in inner if f.is_file() and mime_type_for(f).startswith("image/")],
+                        key=lambda x: x.stat().st_mtime,
+                        reverse=True,
+                    )
+                    if imgs:
+                        preview = str(imgs[0].resolve().relative_to(base_abs)).replace("\\", "/")
+
+                    folders.append({
+                        "name":       rel,
+                        "file_count": count,
+                        "preview":    preview,
+                    })
+                except PermissionError:
+                    continue  # One restricted folder should not crash the whole list
+            else:
+                files.append({
+                    "name":       item.name,
+                    "relpath":    rel,
+                    "size_bytes": item.stat().st_size,
+                    "size_human": human_size(item.stat().st_size),
+                    "mtime":      iso_ts(item),
+                    "mime":       mime_type_for(item),
+                })
+
+        return {"folders": folders, "files": files}
+
+    except Exception as exc:
+        import traceback
+        print(f"[Browse] ERROR on path '{path}': {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Routes – file listing (with pagination)
 # ──────────────────────────────────────────────────────────────────────────────
 
