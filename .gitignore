@@ -9,8 +9,6 @@ __pycache__/
 venv/
 .venv/
 
-# Media folders
-media/
 # Metadata cache
 .metadata.json
 server_id.txt

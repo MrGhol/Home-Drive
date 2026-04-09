@@ -26,12 +26,12 @@ Optional (video thumbnails):
 # install ffmpeg and ensure it is on PATH
 ```
 
-### 2) Run (development)
+### 2) Run
 ```bash
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 3) Run (production)
+### 3) Run (multiple workers)
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 ```
