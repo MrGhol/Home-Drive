@@ -69,7 +69,7 @@ public class ConnectionFragment extends Fragment {
             }
             if (!ip.startsWith("http")) ip = "http://" + ip;
             if (!ip.endsWith("/")) ip += "/";
-            
+
             verifyAndConnect(ip, apiKey);
         });
 
@@ -110,6 +110,12 @@ public class ConnectionFragment extends Fragment {
     }
 
     private void verifyAndConnect(String ip, String apiKey) {
+        if (ip.startsWith("http://") && !NetworkUtils.isPrivateOrLocalHost(ip)) {
+            updateState(ConnectionState.FAILED);
+            Toast.makeText(getContext(), "Refusing insecure HTTP for non-local host. Use HTTPS or a LAN address.", Toast.LENGTH_LONG).show();
+            return;
+        }
+
         updateState(ConnectionState.CONNECTING);
         
         // Temporarily set IP in prefs for Retrofit client to use it

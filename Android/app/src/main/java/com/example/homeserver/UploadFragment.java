@@ -111,13 +111,13 @@ public class UploadFragment extends Fragment {
                 if (exists) {
                     showConflictDialog(fileName);
                 } else {
-                    startUpload(fileName);
+                    startUpload(fileName, false);
                 }
             }
 
             @Override
             public void onFailure(@NonNull Call<ApiService.BrowseResponse> call, @NonNull Throwable t) {
-                if (isAdded()) startUpload(fileName); // Proceed if check fails
+                if (isAdded()) startUpload(fileName, false); // Proceed if check fails
             }
         });
     }
@@ -129,7 +129,7 @@ public class UploadFragment extends Fragment {
                 .setMessage("A file named '" + currentName + "' already exists. What would you like to do?")
                 .setItems(options, (dialog, which) -> {
                     if (which == 0) showRenameDialog(currentName);
-                    else if (which == 1) startUpload(currentName); // Backend overwrites by default based on filename
+                    else if (which == 1) startUpload(currentName, true);
                     else {
                         binding.uploadProgressBar.setVisibility(View.GONE);
                         binding.uploadButton.setEnabled(true);
@@ -145,7 +145,7 @@ public class UploadFragment extends Fragment {
         new AlertDialog.Builder(requireContext())
                 .setTitle("Rename File")
                 .setView(input)
-                .setPositiveButton("Upload", (dialog, which) -> startUpload(input.getText().toString().trim()))
+                .setPositiveButton("Upload", (dialog, which) -> startUpload(input.getText().toString().trim(), false))
                 .setNegativeButton("Cancel", (dialog, which) -> {
                     binding.uploadProgressBar.setVisibility(View.GONE);
                     binding.uploadButton.setEnabled(true);
@@ -153,7 +153,7 @@ public class UploadFragment extends Fragment {
                 .show();
     }
 
-    private void startUpload(String fileName) {
+    private void startUpload(String fileName, boolean overwrite) {
         binding.uploadProgressBar.setVisibility(View.VISIBLE);
         binding.uploadProgressBar.setIndeterminate(true);
         binding.uploadButton.setEnabled(false);
@@ -165,11 +165,11 @@ public class UploadFragment extends Fragment {
 
             Call<ResponseBody> call;
             if (selectedMimeType.startsWith("video/")) {
-                call = RetrofitClient.getApiService(requireContext()).uploadVideo(body);
+                call = RetrofitClient.getApiService(requireContext()).uploadVideo(body, overwrite);
             } else {
                 String folder = binding.folderInput.getText().toString().trim();
                 if (folder.isEmpty()) folder = "Vacation";
-                call = RetrofitClient.getApiService(requireContext()).uploadPhoto(folder, body);
+                call = RetrofitClient.getApiService(requireContext()).uploadPhoto(folder, body, overwrite);
             }
 
             call.enqueue(new Callback<ResponseBody>() {

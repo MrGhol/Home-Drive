@@ -66,11 +66,18 @@ from zeroconf import ServiceInfo, Zeroconf
 # This alone fixes the majority of phone-transfer JPEG issues.
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# Allow larger images (avoid DecompressionBombError) for trusted, local files.
-# Set to None to disable the check entirely, or pick a large integer.
-# WARNING: setting to None removes Pillow's decompression-DoS protection.
-# For a private, trusted home server it's usually fine; otherwise set a big limit.
-Image.MAX_IMAGE_PIXELS = None
+# Allow large images but keep decompression-bomb protection enabled by default.
+# Set MAX_IMAGE_PIXELS=0 to disable entirely, or provide a custom integer.
+_max_pixels_env = os.environ.get("MAX_IMAGE_PIXELS")
+if _max_pixels_env is None:
+    Image.MAX_IMAGE_PIXELS = 200_000_000  # ~200 MP default limit
+elif _max_pixels_env.strip() == "0":
+    Image.MAX_IMAGE_PIXELS = None
+else:
+    try:
+        Image.MAX_IMAGE_PIXELS = int(_max_pixels_env)
+    except ValueError:
+        Image.MAX_IMAGE_PIXELS = 200_000_000
 
 # HEIC/HEIF support – must be registered before any Image.open() call.
 # Install with:  pip install pillow-heif
@@ -84,7 +91,8 @@ except ImportError:
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 
-BASE_DIR   = Path("media")
+_default_media_dir = Path(__file__).resolve().parent / "media"
+BASE_DIR   = Path(os.environ.get("MEDIA_DIR", str(_default_media_dir))).resolve()
 PHOTOS_DIR = BASE_DIR / "photos"
 VIDEOS_DIR = BASE_DIR / "videos"
 THUMB_DIR  = BASE_DIR / ".thumbs"
@@ -329,13 +337,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_cors_env = os.environ.get("CORS_ALLOW_ORIGINS")
+_cors_origins = []
+if _cors_env:
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    # "allow_origins=['*']" is fine for a private LAN.
-    # To lock down: replace with your LAN subnet, e.g.
-    #   allow_origins=["http://192.168.1.0/24"]
-    # or list explicit origins like ["http://192.168.1.100:8000"]
-    allow_origins=["*"],
+    # Set CORS_ALLOW_ORIGINS="http://192.168.1.10:8000,https://example.com"
+    # to explicitly allow cross-origin access. Default: no cross-origin access.
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -669,10 +680,21 @@ def _rebuild_index() -> None:
     """Full scan – O(n files). Called at startup and periodically for drift."""
     global _index_built_at
     new_index: Dict[str, dict] = {}
+    base_abs = BASE_DIR.resolve()
     for p in BASE_DIR.rglob("*"):
-        if p.is_file() and not p.name.startswith("."):
-            rel = str(p.relative_to(BASE_DIR))
-            new_index[rel] = _make_index_entry(p)
+        if not p.is_file():
+            continue
+        if p.name.startswith("."):
+            continue
+        try:
+            rel_path = p.resolve().relative_to(base_abs)
+        except Exception:
+            continue
+        # Skip any hidden directory segments (e.g., ".thumbs")
+        if any(part.startswith(".") for part in rel_path.parts):
+            continue
+        rel = str(rel_path)
+        new_index[rel] = _make_index_entry(p)
     _search_index.clear()
     _search_index.update(new_index)
     _index_built_at = time.monotonic()
@@ -1384,16 +1406,22 @@ def list_videos(
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.get("/search", tags=["search"])
-def search(q: str, request: Request, skip: int = 0, limit: int = 100, _auth=Depends(require_api_key)):
+def search(q: Optional[str] = "", request: Request, skip: int = 0, limit: int = 100, _auth=Depends(require_api_key)):
     rate_limit(request)
     skip  = max(skip, 0)
     limit = max(1, min(limit, 200))
-    if not q or len(q) < 1:
-        raise HTTPException(status_code=400, detail="Query must not be empty.")
-    pattern = q.lower()
+    pattern = (q or "").strip().lower()
     index   = get_index()
-    hits    = [v for v in index.values() if pattern in v["name"].lower()]
+    if not pattern:
+        hits = list(index.values())
+    else:
+        hits = [v for v in index.values() if pattern in v["name"].lower()]
     hits.sort(key=lambda x: x["mtime"], reverse=True)
+
+    if not pattern:
+        files = hits[skip:]
+        return {"total": len(hits), "skip": skip, "limit": len(files), "files": files}
+
     return {"total": len(hits), "skip": skip, "limit": limit, "files": hits[skip: skip + limit]}
 
 
@@ -1699,6 +1727,7 @@ async def _stream_upload(dest: Path, upload: UploadFile, max_bytes: int) -> int:
 async def upload_photo(
     folder_name: str,
     file: UploadFile = File(...),
+    overwrite: bool = False,
     _auth=Depends(require_api_key),
 ):
     # Validate declared MIME (fast, client-supplied)
@@ -1713,12 +1742,21 @@ async def upload_photo(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     filename = sanitize_filename(file.filename)
-    dest     = unique_path(target_dir, filename)
+    if overwrite:
+        dest = target_dir / filename
+        if dest.exists() and dest.is_dir():
+            raise HTTPException(status_code=400, detail="Invalid filename (conflicts with a folder).")
+    else:
+        dest = unique_path(target_dir, filename)
 
     await _stream_upload(dest, file, MAX_PHOTO_BYTES)
 
     # Server-side validation with Pillow
     verify_image_file(dest)
+
+    # If overwriting, invalidate any cached thumbnail for this path.
+    if overwrite:
+        get_thumb_path(f"photos/{folder_name}/{dest.name}").unlink(missing_ok=True)
 
     # Incremental index: add just this one file – O(1), no full rglob.
     _index_add(dest)
@@ -1741,6 +1779,7 @@ async def upload_photo(
 @app.post("/upload/videos", tags=["upload"], status_code=201)
 async def upload_video(
     file: UploadFile = File(...),
+    overwrite: bool = False,
     _auth=Depends(require_api_key),
 ):
     declared_mime = (file.content_type or "").split(";")[0].strip().lower()
@@ -1751,12 +1790,21 @@ async def upload_video(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     filename = sanitize_filename(file.filename)
-    dest     = unique_path(target_dir, filename)
+    if overwrite:
+        dest = target_dir / filename
+        if dest.exists() and dest.is_dir():
+            raise HTTPException(status_code=400, detail="Invalid filename (conflicts with a folder).")
+    else:
+        dest = unique_path(target_dir, filename)
 
     await _stream_upload(dest, file, MAX_VIDEO_BYTES)
 
     # Server-side validation with ffprobe (no-op if ffprobe is absent)
     verify_video_file(dest)
+
+    # If overwriting, invalidate any cached thumbnail for this path.
+    if overwrite:
+        get_thumb_path(f"videos/{dest.name}").unlink(missing_ok=True)
 
     # Incremental index: add just this one file – O(1).
     _index_add(dest)
@@ -1837,4 +1885,5 @@ def not_found(_req, _exc):
 
 @app.exception_handler(500)
 def server_error(_req, exc):
-    return JSONResponse(status_code=500, content={"error": "server error", "detail": str(exc)})
+    print(f"[ERROR] {exc}")
+    return JSONResponse(status_code=500, content={"error": "server error"})

@@ -5,10 +5,11 @@ import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.util.Log;
 
+import java.util.Map;
+
 public class DiscoveryManager {
     private static final String TAG = "DiscoveryManager";
     private static final String SERVICE_TYPE = "_http._tcp.";
-    private static final String SERVICE_NAME_PREFIX = "HomeDrive";
 
     private final NsdManager nsdManager;
     private NsdManager.DiscoveryListener discoveryListener;
@@ -49,19 +50,24 @@ public class DiscoveryManager {
 
             @Override
             public void onServiceFound(NsdServiceInfo serviceInfo) {
-                if (serviceInfo.getServiceName().contains(SERVICE_NAME_PREFIX)) {
-                    nsdManager.resolveService(serviceInfo, new NsdManager.ResolveListener() {
-                        @Override
-                        public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
-                            Log.e(TAG, "Resolve failed: " + errorCode);
-                        }
+                nsdManager.resolveService(serviceInfo, new NsdManager.ResolveListener() {
+                    @Override
+                    public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
+                        Log.e(TAG, "Resolve failed: " + errorCode);
+                    }
 
-                        @Override
-                        public void onServiceResolved(NsdServiceInfo resolvedServiceInfo) {
+                    @Override
+                    public void onServiceResolved(NsdServiceInfo resolvedServiceInfo) {
+                        Map<String, byte[]> attrs = resolvedServiceInfo.getAttributes();
+                        boolean accept = true;
+                        if (attrs != null && !attrs.isEmpty()) {
+                            accept = attrs.containsKey("server_id") || attrs.containsKey("api");
+                        }
+                        if (accept) {
                             callback.onServiceFound(resolvedServiceInfo);
                         }
-                    });
-                }
+                    }
+                });
             }
 
             @Override

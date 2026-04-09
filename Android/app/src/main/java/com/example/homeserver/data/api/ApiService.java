@@ -53,17 +53,22 @@ public interface ApiService {
     @POST("/upload/photos/{folder_name}")
     Call<ResponseBody> uploadPhoto(
         @Path("folder_name") String folderName,
-        @Part MultipartBody.Part file
+        @Part MultipartBody.Part file,
+        @Query("overwrite") boolean overwrite
     );
 
     @Multipart
     @POST("/upload/videos")
     Call<ResponseBody> uploadVideo(
-        @Part MultipartBody.Part file
+        @Part MultipartBody.Part file,
+        @Query("overwrite") boolean overwrite
     );
 
     @DELETE("/files/{file_path}")
     Call<ResponseBody> deleteFile(@Path(value = "file_path", encoded = true) String filePath);
+
+    @DELETE("/folders/photos/{folder_name}")
+    Call<ResponseBody> deleteFolder(@Path("folder_name") String folderName);
 
     class MediaListResponse {
         public int total;

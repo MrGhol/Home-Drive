@@ -2,13 +2,16 @@ package com.example.homeserver;
 
 import android.app.ActivityManager;
 import android.content.Context;
+import android.app.DownloadManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Parcelable;
+import android.os.Environment;
 import android.text.Editable;
 import android.text.TextWatcher;
+import android.text.TextUtils;
 import android.view.LayoutInflater;
 import android.view.MenuItem;
 import android.view.ScaleGestureDetector;
@@ -426,11 +429,25 @@ public class PhotosFragment extends Fragment {
         final int[] completed = {0};
 
         for (Object item : selected) {
-            String relPath = "";
-            if (item instanceof MediaFile) relPath = ((MediaFile) item).getRelpath();
-            else if (item instanceof PhotoFolder) relPath = "folders/photos/" + ((PhotoFolder) item).getName();
+            Call<ResponseBody> call = null;
+            if (item instanceof MediaFile) {
+                String relPath = ((MediaFile) item).getRelpath();
+                call = RetrofitClient.getApiService(requireContext()).deleteFile(relPath);
+            } else if (item instanceof PhotoFolder) {
+                String folderName = ((PhotoFolder) item).getName();
+                call = RetrofitClient.getApiService(requireContext()).deleteFolder(folderName);
+            }
 
-            RetrofitClient.getApiService(requireContext()).deleteFile(relPath).enqueue(new Callback<>() {
+            if (call == null) {
+                completed[0]++;
+                if (completed[0] == total) {
+                    adapter.setSelectionMode(false);
+                    loadContent(currentPath);
+                }
+                continue;
+            }
+
+            call.enqueue(new Callback<>() {
                 @Override
                 public void onResponse(@NonNull Call<ResponseBody> call, @NonNull Response<ResponseBody> response) {
                     completed[0]++;
@@ -453,27 +470,68 @@ public class PhotosFragment extends Fragment {
     }
 
     private void shareItems(Set<Object> selected) {
-        ArrayList<Uri> uris = new ArrayList<>();
+        ArrayList<String> urls = new ArrayList<>();
         SharedPreferences prefs = requireContext().getSharedPreferences("HomeServerPrefs", Context.MODE_PRIVATE);
         String baseUrl = prefs.getString("server_ip", "");
+        String apiKey = prefs.getString("api_key", "");
+        if (baseUrl.isEmpty()) {
+            Toast.makeText(getContext(), "Server IP not configured", Toast.LENGTH_SHORT).show();
+            return;
+        }
         
         for (Object item : selected) {
             if (item instanceof MediaFile) {
                 String url = baseUrl + (baseUrl.endsWith("/") ? "" : "/") + "media/" + ((MediaFile) item).getRelpath();
-                uris.add(Uri.parse(url));
+                if (apiKey != null && !apiKey.isEmpty()) {
+                    String sep = url.contains("?") ? "&" : "?";
+                    url = url + sep + "api_key=" + Uri.encode(apiKey);
+                }
+                urls.add(url);
             }
         }
 
-        if (uris.isEmpty()) return;
+        if (urls.isEmpty()) return;
 
-        Intent intent = new Intent(Intent.ACTION_SEND_MULTIPLE);
-        intent.setType("image/*");
-        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
-        startActivity(Intent.createChooser(intent, "Share Media"));
+        String text = TextUtils.join("\n", urls);
+        Intent intent = new Intent(Intent.ACTION_SEND);
+        intent.setType("text/plain");
+        intent.putExtra(Intent.EXTRA_TEXT, text);
+        startActivity(Intent.createChooser(intent, "Share Links"));
     }
 
     private void downloadItems(Set<Object> selected) {
-        Toast.makeText(getContext(), "Downloading " + selected.size() + " items...", Toast.LENGTH_SHORT).show();
+        SharedPreferences prefs = requireContext().getSharedPreferences("HomeServerPrefs", Context.MODE_PRIVATE);
+        String baseUrl = prefs.getString("server_ip", "");
+        String apiKey = prefs.getString("api_key", "");
+        if (baseUrl.isEmpty()) {
+            Toast.makeText(getContext(), "Server IP not configured", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        DownloadManager dm = (DownloadManager) requireContext().getSystemService(Context.DOWNLOAD_SERVICE);
+        int queued = 0;
+
+        for (Object item : selected) {
+            if (!(item instanceof MediaFile)) continue;
+            MediaFile file = (MediaFile) item;
+            String url = baseUrl + (baseUrl.endsWith("/") ? "" : "/") + "media/" + file.getRelpath();
+            if (apiKey != null && !apiKey.isEmpty()) {
+                String sep = url.contains("?") ? "&" : "?";
+                url = url + sep + "api_key=" + Uri.encode(apiKey);
+            }
+
+            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+            request.setTitle(file.getName());
+            if (file.getMime() != null && !file.getMime().isEmpty()) {
+                request.setMimeType(file.getMime());
+            }
+            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, file.getName());
+            dm.enqueue(request);
+            queued++;
+        }
+
+        Toast.makeText(getContext(), "Queued " + queued + " download(s)", Toast.LENGTH_SHORT).show();
     }
 
     private void navigateTo(String path) {

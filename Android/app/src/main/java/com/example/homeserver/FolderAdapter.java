@@ -76,10 +76,10 @@ public class FolderAdapter extends RecyclerView.Adapter<FolderAdapter.FolderView
                     .diskCacheStrategy(DiskCacheStrategy.NONE)
                     .skipMemoryCache(true)
                     .signature(new ObjectKey(System.currentTimeMillis() / 60000))
-                    .placeholder(R.drawable.photo1)
+                    .placeholder(android.R.drawable.ic_menu_gallery)
                     .into(holder.folderPreview);
         } else {
-            holder.folderPreview.setImageResource(R.drawable.photo1);
+            holder.folderPreview.setImageResource(android.R.drawable.ic_menu_gallery);
         }
 
         holder.itemView.setOnClickListener(v -> listener.onFolderClick(folder));

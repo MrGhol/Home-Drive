@@ -122,7 +122,7 @@ public class TimelineAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolde
                 .signature(new ObjectKey(file.getMtime()))
                 .override(320, 320)
                 .centerCrop()
-                .placeholder(R.drawable.photo1)
+                .placeholder(android.R.drawable.ic_menu_gallery)
                 .into(holder.image);
 
         holder.videoIndicator.setVisibility(file.getMime().startsWith("video/") ? View.VISIBLE : View.GONE);

@@ -76,8 +76,8 @@ public class MediaAdapter extends RecyclerView.Adapter<MediaAdapter.MediaViewHol
                 .signature(new ObjectKey(file.getMtime())) // Use mtime to invalidate stale placeholders
                 .override(320, 320)
                 .centerCrop()
-                .placeholder(R.drawable.photo1)
-                .error(R.drawable.photo1)
+                .placeholder(android.R.drawable.ic_menu_gallery)
+                .error(android.R.drawable.ic_menu_gallery)
                 .into(holder.photoImage);
 
         holder.videoIndicator.setVisibility(file.getMime().startsWith("video/") ? View.VISIBLE : View.GONE);

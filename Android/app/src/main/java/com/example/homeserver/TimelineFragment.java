@@ -73,21 +73,18 @@ public class TimelineFragment extends Fragment {
         
         binding.progressBar.setVisibility(View.VISIBLE);
         allMediaList.clear();
-        // We will now try to get everything by performing an empty search, 
-        // which the backend should interpret as "get all".
-        
+
         RetrofitClient.getApiService(requireContext()).search("").enqueue(new Callback<ApiService.MediaListResponse>() {
             @Override
             public void onResponse(@NonNull Call<ApiService.MediaListResponse> call, @NonNull Response<ApiService.MediaListResponse> response) {
                 if (!isAdded() || binding == null) return;
-                
+
                 binding.progressBar.setVisibility(View.GONE);
                 binding.swipeRefresh.setRefreshing(false);
 
                 if (response.isSuccessful() && response.body() != null) {
                     List<MediaFile> files = response.body().files;
                     if (files == null || files.isEmpty()) {
-                        // If search("") is empty, fallback to fetching from root folders
                         fetchFromRootFolders();
                     } else {
                         updateTimeline(files);

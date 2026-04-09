@@ -31,6 +31,7 @@ android {
     }
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 }
 
@@ -68,10 +69,6 @@ dependencies {
 
     // WorkManager for Background Uploads
     implementation(libs.work.runtime)
-
-    // Room for Offline Metadata
-    implementation(libs.room.runtime)
-    annotationProcessor(libs.room.compiler)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)

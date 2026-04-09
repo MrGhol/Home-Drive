@@ -3,6 +3,8 @@ package com.example.homeserver.data.api;
 import android.content.Context;
 import android.content.SharedPreferences;
 
+import com.example.homeserver.BuildConfig;
+
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.logging.HttpLoggingInterceptor;
@@ -32,7 +34,9 @@ public class RetrofitClient {
             }
 
             HttpLoggingInterceptor logging = new HttpLoggingInterceptor();
-            logging.setLevel(HttpLoggingInterceptor.Level.BODY);
+            logging.setLevel(BuildConfig.DEBUG
+                    ? HttpLoggingInterceptor.Level.BODY
+                    : HttpLoggingInterceptor.Level.BASIC);
 
             OkHttpClient client = new OkHttpClient.Builder()
                     .addInterceptor(logging)

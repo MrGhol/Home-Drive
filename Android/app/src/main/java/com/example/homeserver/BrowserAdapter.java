@@ -229,7 +229,7 @@ public class BrowserAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             Glide.with(holder.itemView.getContext())
                     .load(thumbUrl)
                     .centerCrop()
-                    .placeholder(R.drawable.photo1)
+                    .placeholder(android.R.drawable.ic_menu_gallery)
                     .into(holder.preview);
         } else {
             holder.preview.setImageResource(android.R.drawable.ic_menu_gallery);
@@ -273,7 +273,7 @@ public class BrowserAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                 .signature(new ObjectKey(file.getMtime()))
                 .override(320, 320)
                 .centerCrop()
-                .placeholder(R.drawable.photo1)
+                .placeholder(android.R.drawable.ic_menu_gallery)
                 .into(holder.image);
 
         if (file.getMime().startsWith("video/")) {

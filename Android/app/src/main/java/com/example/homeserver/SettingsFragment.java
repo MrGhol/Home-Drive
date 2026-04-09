@@ -2,15 +2,20 @@ package com.example.homeserver;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Toast;
 
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatDelegate;
+import androidx.core.content.ContextCompat;
 import androidx.fragment.app.Fragment;
 import androidx.work.Constraints;
 import androidx.work.ExistingPeriodicWorkPolicy;
@@ -31,6 +36,9 @@ import retrofit2.Response;
 public class SettingsFragment extends Fragment {
 
     private FragmentSettingsBinding binding;
+    private SharedPreferences prefs;
+    private ActivityResultLauncher<String[]> permissionLauncher;
+    private boolean suppressAutoBackupToggle = false;
     private static final String PREFS_NAME = "HomeServerPrefs";
     private static final String KEY_THEME = "app_theme";
     private static final String KEY_IP = "server_ip";
@@ -47,10 +55,39 @@ public class SettingsFragment extends Fragment {
     }
 
     @Override
+    public void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        permissionLauncher = registerForActivityResult(
+                new ActivityResultContracts.RequestMultiplePermissions(),
+                result -> {
+                    if (!isAdded() || binding == null) return;
+                    boolean allGranted = true;
+                    for (Boolean granted : result.values()) {
+                        if (!granted) {
+                            allGranted = false;
+                            break;
+                        }
+                    }
+                    if (allGranted) {
+                        scheduleBackup(prefs);
+                        Toast.makeText(getContext(), "Auto Backup Enabled", Toast.LENGTH_SHORT).show();
+                    } else {
+                        suppressAutoBackupToggle = true;
+                        binding.switchAutoBackup.setChecked(false);
+                        suppressAutoBackupToggle = false;
+                        prefs.edit().putBoolean(KEY_AUTO_BACKUP, false).apply();
+                        updateBackupSwitchState(false);
+                        Toast.makeText(getContext(), "Permission required for auto backup", Toast.LENGTH_SHORT).show();
+                    }
+                }
+        );
+    }
+
+    @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
 
-        SharedPreferences prefs = requireActivity().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        prefs = requireActivity().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         
         // --- IP Management ---
         binding.ipInput.setText(prefs.getString(KEY_IP, ""));
@@ -62,6 +99,10 @@ public class SettingsFragment extends Fragment {
             }
             if (!newIp.startsWith("http")) newIp = "http://" + newIp;
             if (!newIp.endsWith("/")) newIp += "/";
+            if (newIp.startsWith("http://") && !NetworkUtils.isPrivateOrLocalHost(newIp)) {
+                binding.ipInputLayout.setError("HTTP allowed only on local network. Use HTTPS or a LAN address.");
+                return;
+            }
 
             prefs.edit().putString(KEY_IP, newIp).apply();
             RetrofitClient.resetClient();
@@ -80,10 +121,16 @@ public class SettingsFragment extends Fragment {
         updateBackupSwitchState(binding.switchAutoBackup.isChecked());
 
         binding.switchAutoBackup.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (suppressAutoBackupToggle) return;
             prefs.edit().putBoolean(KEY_AUTO_BACKUP, isChecked).apply();
             updateBackupSwitchState(isChecked);
             if (isChecked) {
-                scheduleBackup(prefs);
+                if (hasMediaReadPermission()) {
+                    scheduleBackup(prefs);
+                    Toast.makeText(getContext(), "Auto Backup Enabled", Toast.LENGTH_SHORT).show();
+                } else {
+                    requestMediaPermissions();
+                }
             } else {
                 cancelBackup();
             }
@@ -177,12 +224,33 @@ public class SettingsFragment extends Fragment {
                 ExistingPeriodicWorkPolicy.REPLACE,
                 backupRequest
         );
-        Toast.makeText(getContext(), "Auto Backup Enabled", Toast.LENGTH_SHORT).show();
     }
 
     private void cancelBackup() {
         WorkManager.getInstance(requireContext()).cancelUniqueWork("AutoBackup");
         Toast.makeText(getContext(), "Auto Backup Disabled", Toast.LENGTH_SHORT).show();
+    }
+
+    private boolean hasMediaReadPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            int img = ContextCompat.checkSelfPermission(requireContext(), android.Manifest.permission.READ_MEDIA_IMAGES);
+            int vid = ContextCompat.checkSelfPermission(requireContext(), android.Manifest.permission.READ_MEDIA_VIDEO);
+            return img == PackageManager.PERMISSION_GRANTED && vid == PackageManager.PERMISSION_GRANTED;
+        } else {
+            int read = ContextCompat.checkSelfPermission(requireContext(), android.Manifest.permission.READ_EXTERNAL_STORAGE);
+            return read == PackageManager.PERMISSION_GRANTED;
+        }
+    }
+
+    private void requestMediaPermissions() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissionLauncher.launch(new String[] {
+                    android.Manifest.permission.READ_MEDIA_IMAGES,
+                    android.Manifest.permission.READ_MEDIA_VIDEO
+            });
+        } else {
+            permissionLauncher.launch(new String[] { android.Manifest.permission.READ_EXTERNAL_STORAGE });
+        }
     }
 
     @Override
