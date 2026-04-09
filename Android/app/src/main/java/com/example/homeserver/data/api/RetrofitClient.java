@@ -2,122 +2,142 @@ package com.example.homeserver.data.api;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.util.Log;
 
 import com.example.homeserver.BuildConfig;
 
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
+import okhttp3.HttpUrl;
+import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
+import okhttp3.Response;
 import okhttp3.logging.HttpLoggingInterceptor;
 import retrofit2.Retrofit;
 import retrofit2.converter.gson.GsonConverterFactory;
 
 public class RetrofitClient {
 
-    private static volatile ApiService apiService = null;
-    private static String cachedBaseUrl = null;
-    private static String cachedApiKey = null;
-
+    private static final String TAG = "RetrofitClient";
     private static final String PREFS_NAME = "HomeServerPrefs";
     private static final String KEY_IP = "server_ip";
     private static final String KEY_API_KEY = "api_key";
 
-    // Standard timeouts for home server operations
     private static final int TIMEOUT_CONNECT = 15;
     private static final int TIMEOUT_READ = 30;
-    private static final int TIMEOUT_WRITE = 30;
 
-    /**
-     * Returns a thread-safe singleton ApiService. 
-     * If the server IP or API Key changes in SharedPreferences, the client is rebuilt.
-     */
+    private static volatile ApiService apiService = null;
+    private static String cachedBaseUrl = null;
+    private static String cachedApiKey = null;
+
+    private RetrofitClient() { }
+
     public static synchronized ApiService getApiService(Context context) {
-        // Use Application Context to prevent memory leaks
-        Context appContext = context.getApplicationContext();
-        SharedPreferences prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        
-        String rawIp = prefs.getString(KEY_IP, "").trim();
-        String apiKey = prefs.getString(KEY_API_KEY, "").trim();
+        if (context == null) return null;
 
-        // Validate and Normalize URL
-        String baseUrl = formatUrl(rawIp);
+        SharedPreferences prefs = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
 
-        // Rebuild if any settings changed or if never initialized
-        if (apiService == null || !baseUrl.equals(cachedBaseUrl) || !apiKey.equals(cachedApiKey)) {
-            cachedBaseUrl = baseUrl;
-            cachedApiKey = apiKey;
+        String rawIp = safeTrim(prefs.getString(KEY_IP, ""));
+        String apiKey = safeTrim(prefs.getString(KEY_API_KEY, ""));
 
+        if (rawIp.isEmpty()) {
+            resetCache();
+            return null;
+        }
+
+        HttpUrl baseUrl = buildBaseUrl(rawIp);
+        if (baseUrl == null) {
+            resetCache();
+            return null;
+        }
+
+        String normalizedBaseUrl = baseUrl.toString();
+
+        if (apiService != null
+                && normalizedBaseUrl.equals(cachedBaseUrl)
+                && apiKey.equals(cachedApiKey)) {
+            return apiService;
+        }
+
+        try {
             HttpLoggingInterceptor logging = new HttpLoggingInterceptor();
             logging.setLevel(BuildConfig.DEBUG
                     ? HttpLoggingInterceptor.Level.BODY
-                    : HttpLoggingInterceptor.Level.BASIC);
+                    : HttpLoggingInterceptor.Level.NONE);
 
-            final String currentApiKey = apiKey;
             OkHttpClient client = new OkHttpClient.Builder()
                     .addInterceptor(logging)
-                    .addInterceptor(chain -> {
-                        Request original = chain.request();
-                        Request.Builder requestBuilder = original.newBuilder();
-                        // Add API Key header if present
-                        if (!currentApiKey.isEmpty()) {
-                            requestBuilder.header("x-api-key", currentApiKey);
+                    .addInterceptor(new Interceptor() {
+                        @Override
+                        public Response intercept(Chain chain) throws java.io.IOException {
+                            Request original = chain.request();
+                            Request.Builder builder = original.newBuilder();
+
+                            if (!apiKey.isEmpty()) {
+                                builder.header("x-api-key", apiKey);
+                            }
+
+                            return chain.proceed(builder.build());
                         }
-                        return chain.proceed(requestBuilder.build());
                     })
                     .connectTimeout(TIMEOUT_CONNECT, TimeUnit.SECONDS)
                     .readTimeout(TIMEOUT_READ, TimeUnit.SECONDS)
-                    .writeTimeout(TIMEOUT_WRITE, TimeUnit.SECONDS)
                     .build();
 
-            try {
-                Retrofit retrofit = new Retrofit.Builder()
-                        .baseUrl(baseUrl)
-                        .addConverterFactory(GsonConverterFactory.create())
-                        .client(client)
-                        .build();
+            Retrofit retrofit = new Retrofit.Builder()
+                    .baseUrl(baseUrl)
+                    .addConverterFactory(GsonConverterFactory.create())
+                    .client(client)
+                    .build();
 
-                apiService = retrofit.create(ApiService.class);
-            } catch (Exception e) {
-                // Log error and return null to indicate misconfiguration
-                e.printStackTrace();
-                apiService = null; 
-            }
+            apiService = retrofit.create(ApiService.class);
+            cachedBaseUrl = normalizedBaseUrl;
+            cachedApiKey = apiKey;
+
+            return apiService;
+
+        } catch (Exception e) {
+            Log.e(TAG, "getApiService: Failed to build Retrofit", e);
+            resetCache();
+            return null;
         }
-
-        return apiService;
     }
 
-    /**
-     * Normalizes the URL for Retrofit.
-     * Ensures it has a protocol and ends with a trailing slash.
-     */
-    private static String formatUrl(String url) {
-        if (url == null || url.isEmpty()) {
-            return "http://localhost/";
+    private static HttpUrl buildBaseUrl(String rawUrl) {
+        String url = safeTrim(rawUrl);
+        if (url.isEmpty()) return null;
+
+        if (!url.toLowerCase(Locale.US).startsWith("http://")
+                && !url.toLowerCase(Locale.US).startsWith("https://")) {
+            url = "http://" + url;
         }
 
-        String formatted = url.trim();
-        
-        // Remove trailing slashes before re-adding one (handles "ip//" cases)
-        while (formatted.endsWith("/")) {
-            formatted = formatted.substring(0, formatted.length() - 1);
+        HttpUrl parsed = HttpUrl.parse(url);
+        if (parsed == null) return null;
+
+        if (parsed.encodedPath().endsWith("/")) {
+            return parsed;
         }
 
-        if (!formatted.startsWith("http://") && !formatted.startsWith("https://")) {
-            formatted = "http://" + formatted;
-        }
-        
-        // Retrofit requires base URL to end with /
-        return formatted + "/";
+        return parsed.newBuilder()
+                .addPathSegment("")
+                .build();
     }
 
-    /**
-     * Resets the client cache. Useful for force-logout or explicit IP reset.
-     */
-    public static synchronized void resetClient() {
+    private static String safeTrim(String value) {
+        return value == null ? "" : value.trim();
+    }
+
+    private static void resetCache() {
         apiService = null;
         cachedBaseUrl = null;
         cachedApiKey = null;
+    }
+
+    public static synchronized void resetClient() {
+        resetCache();
     }
 }
