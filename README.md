@@ -107,3 +107,7 @@ This project is designed for trusted local networks. If you expose it outside yo
 - Enabling `MEDIA_API_KEY`
 - Restricting CORS origins
 - Putting it behind a reverse proxy with TLS and auth
+
+## License
+
+MIT License

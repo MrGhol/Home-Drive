@@ -1490,13 +1490,15 @@ async def thumbnail_video(
     _auth=Depends(require_api_key),
 ):
     rate_limit(request)
-    src = ensure_in_base(file_path)
+    # Normalize file_path to use forward slashes for compatibility
+    normalized_path = file_path.replace("\\", "/")
+    src = ensure_in_base(normalized_path)
     if not src.exists() or not src.is_file():
         raise HTTPException(status_code=404, detail="File not found.")
     if not shutil.which("ffmpeg"):
         raise HTTPException(status_code=501, detail="ffmpeg is not installed – video thumbnails unavailable.")
 
-    thumb     = get_thumb_path(file_path)
+    thumb     = get_thumb_path(normalized_path)
     src_mtime = src.stat().st_mtime
 
     # Fast path: validate fully before trusting the cache.
@@ -1508,7 +1510,7 @@ async def thumbnail_video(
             thumb.unlink(missing_ok=True)
 
     # Slow path: serialise concurrent requests for the same video thumbnail.
-    cache_key = hash_for(file_path)
+    cache_key = hash_for(normalized_path)
     if cache_key not in _thumb_locks:
         _thumb_locks[cache_key] = asyncio.Lock()
     lock = _thumb_locks[cache_key]
