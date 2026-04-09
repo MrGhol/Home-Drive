@@ -1,0 +1,33 @@
+gitignore
+# --- Android / JAVA Build ---
+.gradle/
+/build/
+!/build.gradle
+*.iml
+.externalNativeBuild/
+.cxx/
+/captures/
+*.hprof
+
+# --- IDE (Android Studio / IntelliJ) ---
+.idea/
+*.ipr
+*.iws
+.navigation/
+
+# --- Secrets & Signing (CRITICAL) ---
+# Never commit your private keys or SDK paths
+local.properties
+*.jks
+*.keystore
+*.p12
+google-services.json
+secrets.properties
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+
+# --- User/Tool Specific ---
+.last_build_id
+.aiassistant/
