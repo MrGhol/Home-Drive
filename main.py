@@ -1406,7 +1406,7 @@ def list_videos(
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.get("/search", tags=["search"])
-def search(q: Optional[str] = "", request: Request, skip: int = 0, limit: int = 100, _auth=Depends(require_api_key)):
+def search(request: Request, q: Optional[str] = "", skip: int = 0, limit: int = 100, _auth=Depends(require_api_key)):
     rate_limit(request)
     skip  = max(skip, 0)
     limit = max(1, min(limit, 200))
