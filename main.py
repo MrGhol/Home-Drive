@@ -12,7 +12,7 @@ Optional:
     - MEDIA_API_KEY env var → enables simple API-key protection
 
 Run (development):
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 Run (production):
     uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4

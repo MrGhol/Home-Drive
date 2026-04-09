@@ -1,0 +1,27 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Base.Theme.HomeServer" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/md_theme_light_primary</item>
+        <item name="colorOnPrimary">@color/md_theme_light_onPrimary</item>
+        <item name="colorPrimaryContainer">@color/md_theme_light_primaryContainer</item>
+        <item name="colorOnPrimaryContainer">@color/md_theme_light_onPrimaryContainer</item>
+
+        <item name="android:windowBackground">@color/md_theme_light_surface</item>
+        <item name="android:statusBarColor">?attr/colorPrimaryContainer</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+
+    <style name="Theme.HomeServer" parent="Base.Theme.HomeServer" />
+
+    <!-- Dark Theme Overrides -->
+    <style name="Theme.HomeServer.Dark" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/md_theme_dark_primary</item>
+        <item name="colorOnPrimary">@color/md_theme_dark_onPrimary</item>
+        <item name="colorPrimaryContainer">@color/md_theme_dark_primaryContainer</item>
+        <item name="colorOnPrimaryContainer">@color/md_theme_dark_onPrimaryContainer</item>
+
+        <item name="android:windowBackground">@color/md_theme_dark_surface</item>
+        <item name="android:statusBarColor">?attr/colorPrimaryContainer</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

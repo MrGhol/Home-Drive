@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <item
+        android:id="@+id/action_share"
+        android:icon="@android:drawable/ic_menu_share"
+        android:title="Share"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/action_download"
+        android:icon="@android:drawable/stat_sys_download"
+        android:title="Download"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/action_move"
+        android:icon="@android:drawable/ic_menu_set_as"
+        android:title="Move"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/action_delete"
+        android:icon="@android:drawable/ic_menu_delete"
+        android:title="Delete"
+        app:showAsAction="ifRoom" />
+    <item
+        android:id="@+id/action_album"
+        android:icon="@android:drawable/ic_menu_add"
+        android:title="Create Album"
+        app:showAsAction="never" />
+</menu>

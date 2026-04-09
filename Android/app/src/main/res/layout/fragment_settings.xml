@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/settingsTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Settings"
+            android:textSize="24sp"
+            android:textStyle="bold"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintStart_toStartOf="parent" />
+
+        <!-- Connection Section -->
+        <TextView
+            android:id="@+id/connectionLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="Connection"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            app:layout_constraintTop_toBottomOf="@id/settingsTitle"
+            app:layout_constraintStart_toStartOf="parent" />
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/ipInputLayout"
+            style="@style/Widget.MaterialComponents.TextInputLayout.OutlinedBox"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="Server IP"
+            app:layout_constraintTop_toBottomOf="@id/connectionLabel">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/ipInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="textUri" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <Button
+            android:id="@+id/saveIpButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Update IP"
+            app:layout_constraintTop_toBottomOf="@id/ipInputLayout"
+            app:layout_constraintEnd_toEndOf="parent" />
+
+        <!-- Server Info Card (Version Sync Awareness) -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/serverInfoCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            app:cardCornerRadius="8dp"
+            app:cardElevation="0dp"
+            app:strokeWidth="1dp"
+            app:strokeColor="?attr/colorOutlineVariant"
+            android:visibility="gone"
+            app:layout_constraintTop_toBottomOf="@id/saveIpButton">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="12dp">
+
+                <TextView
+                    android:id="@+id/serverNameText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Server: -"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/serverVersionText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="Backend Version: -"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@+id/serverIdText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="ID: -"
+                    android:textSize="10sp"
+                    android:textColor="#757575" />
+
+                <TextView
+                    android:id="@+id/serverMismatchWarning"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="⚠️ Server ID mismatch! Please re-verify."
+                    android:textColor="?attr/colorError"
+                    android:textSize="12sp"
+                    android:textStyle="bold"
+                    android:visibility="gone" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Auto Backup Section -->
+        <TextView
+            android:id="@+id/backupLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="Automatic Backup"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            app:layout_constraintTop_toBottomOf="@id/serverInfoCard"
+            app:layout_constraintStart_toStartOf="parent" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchAutoBackup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Enable Auto Backup"
+            app:layout_constraintTop_toBottomOf="@id/backupLabel" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchWifiOnly"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="WiFi Only"
+            android:enabled="false"
+            app:layout_constraintTop_toBottomOf="@id/switchAutoBackup" />
+
+        <com.google.android.material.switchmaterial.SwitchMaterial
+            android:id="@+id/switchChargingOnly"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="While Charging Only"
+            android:enabled="false"
+            app:layout_constraintTop_toBottomOf="@id/switchWifiOnly" />
+
+        <!-- Theme Section -->
+        <TextView
+            android:id="@+id/themeLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="Appearance"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            app:layout_constraintTop_toBottomOf="@id/switchChargingOnly"
+            app:layout_constraintStart_toStartOf="parent" />
+
+        <com.google.android.material.button.MaterialButtonToggleGroup
+            android:id="@+id/themeToggleGroup"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            app:singleSelection="true"
+            app:selectionRequired="true"
+            app:layout_constraintTop_toBottomOf="@id/themeLabel"
+            app:layout_constraintStart_toStartOf="parent">
+
+            <Button
+                android:id="@+id/buttonLight"
+                style="?attr/materialButtonOutlinedStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Light" />
+
+            <Button
+                android:id="@+id/buttonDark"
+                style="?attr/materialButtonOutlinedStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Dark" />
+
+            <Button
+                android:id="@+id/buttonSystem"
+                style="?attr/materialButtonOutlinedStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="System" />
+
+        </com.google.android.material.button.MaterialButtonToggleGroup>
+
+        <!-- About Section -->
+        <TextView
+            android:id="@+id/aboutLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="About"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            app:layout_constraintTop_toBottomOf="@id/themeToggleGroup"
+            app:layout_constraintStart_toStartOf="parent" />
+
+        <TextView
+            android:id="@+id/versionText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Home Drive v2.0.0"
+            android:textColor="#757575"
+            app:layout_constraintTop_toBottomOf="@id/aboutLabel"
+            app:layout_constraintStart_toStartOf="parent" />
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+</androidx.core.widget.NestedScrollView>

@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">HomeServer</string>
+    <string name="folder_item_count">%1$d items</string>
+</resources>

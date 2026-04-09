@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <item
+        android:id="@+id/action_share"
+        android:icon="@android:drawable/ic_menu_share"
+        android:title="Share"
+        app:iconTint="@android:color/white"
+        app:showAsAction="ifRoom" />
+
+    <item
+        android:id="@+id/action_download"
+        android:icon="@android:drawable/stat_sys_download"
+        android:title="Download"
+        app:iconTint="@android:color/white"
+        app:showAsAction="ifRoom" />
+
+    <item
+        android:id="@+id/action_speed"
+        android:title="Playback Speed"
+        app:showAsAction="never">
+        <menu>
+            <item android:id="@+id/action_speed_05" android:title="0.5x" />
+            <item android:id="@+id/action_speed_10" android:title="1.0x" />
+            <item android:id="@+id/action_speed_15" android:title="1.5x" />
+            <item android:id="@+id/action_speed_20" android:title="2.0x" />
+        </menu>
+    </item>
+
+    <item
+        android:id="@+id/action_info"
+        android:icon="@android:drawable/ic_dialog_info"
+        android:title="Info"
+        app:iconTint="@android:color/white"
+        app:showAsAction="ifRoom" />
+
+    <item
+        android:id="@+id/action_delete"
+        android:icon="@android:drawable/ic_menu_delete"
+        android:title="Delete"
+        app:iconTint="@android:color/white"
+        app:showAsAction="ifRoom" />
+</menu>
